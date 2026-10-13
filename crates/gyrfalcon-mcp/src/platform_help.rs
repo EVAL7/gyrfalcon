@@ -9,7 +9,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -19,7 +19,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 const MAX_SECTION: usize = 800;
 const MIN_TERM_MATCHES: usize = 2;
 const TARGET_SCORE_WINDOW: usize = 20;
-const CACHE_SCHEMA: u32 = 1;
+/// 3 — страницы типов и английские имена (MCP-06). Кэш младшей схемы их не
+/// знает, а без смены схемы считался бы актуальным для неизменной справки:
+/// `name_en` прочитался бы пустым через `serde(default)` — молча.
+const CACHE_SCHEMA: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Item {
@@ -32,6 +35,12 @@ struct Item {
     availability: String,
     example: String,
     path: String,
+    /// Английское имя из заголовка: «Запрос (Query)» → `Query`,
+    /// «Структура.Вставить (Structure.Insert)» → `Insert`. Код на английском
+    /// встречается в типовых (ERP 13.10.2026: `QueryResultIteration`,
+    /// `Metadata`, `ThisForm` — 37 ложных тревог без этого поля).
+    #[serde(default)]
+    name_en: String,
 }
 
 #[derive(Debug)]
@@ -81,19 +90,16 @@ pub fn suggest(task: &str, source: &str, cursor: Option<&Value>, limit: usize) -
 
     let terms = stems(task);
     let task_low = task.to_lowercase();
-    let has_exact_title = catalog.items.iter().any(|item| {
+    // Страницы типов нужны проверке контекста (`check_bsl`), а не подсказке:
+    // синтаксиса у них нет, и в выдаче они вытеснили бы методы описаниями.
+    let api = || catalog.items.iter().filter(|i| i.kind != "type");
+    let has_exact_title = api().any(|item| {
         let title = item.title.to_lowercase();
         task_low.contains(&title) || title.contains(&task_low)
     });
-    let owners: HashSet<String> = catalog
-        .items
-        .iter()
-        .map(|item| item.owner.clone())
-        .collect();
+    let owners: HashSet<String> = api().map(|item| item.owner.clone()).collect();
     let target_owners = select_target_owners(owners.iter().map(String::as_str), task, &terms);
-    let mut ranked: Vec<(usize, &Item)> = catalog
-        .items
-        .iter()
+    let mut ranked: Vec<(usize, &Item)> = api()
         .filter_map(|item| {
             if !target_owners.is_empty() && !target_owners.contains(&item.owner.to_lowercase()) {
                 return None;
@@ -173,9 +179,7 @@ pub fn suggest(task: &str, source: &str, cursor: Option<&Value>, limit: usize) -
         .map(|(whole, owner, name)| {
             let owner = owner.to_lowercase();
             let name = name.to_lowercase();
-            catalog
-                .items
-                .iter()
+            api()
                 .filter(|i| {
                     i.owner.to_lowercase() == owner && i.name.to_lowercase().starts_with(&name)
                 })
@@ -204,6 +208,7 @@ pub fn suggest(task: &str, source: &str, cursor: Option<&Value>, limit: usize) -
         .filter(|i| i.kind == "constructor")
         .count();
     let events = catalog.items.iter().filter(|i| i.kind == "event").count();
+    let types = catalog.items.iter().filter(|i| i.kind == "type").count();
     let mut target_owner_list: Vec<&str> = target_owners.iter().map(String::as_str).collect();
     target_owner_list.sort();
     json!({
@@ -225,12 +230,154 @@ pub fn suggest(task: &str, source: &str, cursor: Option<&Value>, limit: usize) -
             "properties": properties,
             "constructors": constructors,
             "events": events,
+            "types": types,
         },
         "items": items,
         "completions": completions,
         "no_reliable_suggestions": items.is_empty() && completions.is_empty(),
         "note": "Источник — локальный официальный shcntx_ru.hbk. Возвращаются только точное имя либо совпадение минимум по двум значимым основам слов; слабые результаты скрыты."
     })
+}
+
+/// Доступен ли элемент платформы на тонком клиенте — по разделу «Доступность».
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnThinClient {
+    Yes,
+    No,
+    /// Раздел пуст: справка молчит, и проверка обязана молчать вместе с ней.
+    Unknown,
+}
+
+impl OnThinClient {
+    fn of(availability: &str) -> Self {
+        if availability.trim().is_empty() {
+            OnThinClient::Unknown
+        } else if availability.to_lowercase().contains("тонкий клиент") {
+            OnThinClient::Yes
+        } else {
+            OnThinClient::No
+        }
+    }
+}
+
+/// Сведения справки, нужные проверке контекста исполнения (`check_bsl`).
+///
+/// Отдельно от подсказок: тем нужен поиск по смыслу, здесь — точный ответ
+/// по имени. Имена хранятся в нижнем регистре: BSL к регистру безразличен.
+#[derive(Debug, Default)]
+pub struct PlatformContext {
+    types: HashMap<String, (String, OnThinClient)>,
+    global_methods: HashMap<String, (String, OnThinClient)>,
+    global_props: HashMap<String, (String, OnThinClient)>,
+    /// Имена свойств ВСЕХ типов платформы. В модуле формы или объекта
+    /// свойства владельца — голые имена (`Элементы`, `Ссылка`, `Модифицированность`),
+    /// и без этого множества каждое из них выглядело бы неопределённой переменной.
+    member_props: HashSet<String>,
+}
+
+/// Владелец глобальных методов и свойств в справке 8.3.
+const GLOBAL_OWNER: &str = "глобальный контекст";
+
+impl PlatformContext {
+    fn from_items(items: &[Item]) -> Self {
+        let mut c = PlatformContext::default();
+        // Каждая страница регистрируется под обоими именами: код на английском
+        // законен так же, как на русском.
+        let имена = |i: &Item| {
+            let mut v = vec![i.name.to_lowercase()];
+            if !i.name_en.is_empty() {
+                v.push(i.name_en.to_lowercase());
+            }
+            v
+        };
+        for i in items {
+            for name in имена(i) {
+                c.add(i, name);
+            }
+        }
+        c
+    }
+
+    fn add(&mut self, i: &Item, name: String) {
+        let entry = (i.title.clone(), OnThinClient::of(&i.availability));
+        match i.kind.as_str() {
+            "type" => {
+                // Тип с двумя одноимёнными страницами (редкость) — берём
+                // более строгую: ложное «доступно» хуже ложного молчания.
+                self.types
+                    .entry(name)
+                    .and_modify(|e| {
+                        if entry.1 == OnThinClient::No {
+                            *e = entry.clone();
+                        }
+                    })
+                    .or_insert(entry);
+            }
+            "method" if i.owner.to_lowercase() == GLOBAL_OWNER => {
+                self.global_methods.insert(name, entry);
+            }
+            "property" if i.owner.to_lowercase() == GLOBAL_OWNER => {
+                self.global_props.insert(name, entry);
+            }
+            "property" => {
+                self.member_props.insert(name);
+            }
+            _ => {}
+        }
+    }
+
+    /// Тип для `Новый X`: (заголовок страницы, доступность). `None` — такого
+    /// типа справка не знает (например, тип конфигурации).
+    pub fn new_type(&self, name: &str) -> Option<&(String, OnThinClient)> {
+        self.types.get(&name.to_lowercase())
+    }
+
+    pub fn global_method(&self, name: &str) -> Option<&(String, OnThinClient)> {
+        self.global_methods.get(&name.to_lowercase())
+    }
+
+    pub fn global_property(&self, name: &str) -> Option<&(String, OnThinClient)> {
+        self.global_props.get(&name.to_lowercase())
+    }
+
+    /// Законно ли имя как голый идентификатор с точки зрения платформы:
+    /// глобальное свойство, имя типа (системные перечисления пишутся так —
+    /// `РежимДиалогаВопрос.ДаНет`) или свойство владельца модуля.
+    pub fn is_known_name(&self, name: &str) -> bool {
+        let n = name.to_lowercase();
+        self.global_props.contains_key(&n)
+            || self.types.contains_key(&n)
+            || self.member_props.contains(&n)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.types.is_empty() && self.global_methods.is_empty()
+    }
+}
+
+static CONTEXT: OnceLock<Result<PlatformContext, String>> = OnceLock::new();
+
+/// Сведения о контексте из локальной справки платформы — один раз на процесс.
+pub fn context() -> Result<&'static PlatformContext, String> {
+    CONTEXT
+        .get_or_init(|| {
+            let catalog = CATALOG
+                .get_or_init(load_catalog)
+                .as_ref()
+                .map_err(Clone::clone)?;
+            Ok(PlatformContext::from_items(&catalog.items))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+#[cfg(test)]
+pub(crate) fn context_from_pages(pages: &[(&str, &str)]) -> PlatformContext {
+    let items: Vec<Item> = pages
+        .iter()
+        .filter_map(|(path, html)| parse_page(path, html))
+        .collect();
+    PlatformContext::from_items(&items)
 }
 
 fn select_target_owners<'a>(
@@ -470,16 +617,74 @@ fn interesting_path(path: &str) -> bool {
         || path.contains("/properties/")
         || path.contains("/ctors/")
         || path.contains("/events/")
+        || is_type_page(path)
+}
+
+/// Страница самого типа: `objects/…/Query.html`.
+///
+/// Доступность ТИПА записана только здесь, а не на странице конструктора:
+/// замер по 8.3.27 (13.10.2026) — у всех 444 конструкторов раздел пуст, у
+/// 2417 страниц-типов заполнен. Без этих страниц `Новый Запрос` на клиенте
+/// не отличить от `Новый Массив`. Страницы-оглавления (`…/catalog393.html`)
+/// и служебные разделы (`formparams`) отсекаются в `parse_page` отсутствием
+/// раздела «Доступность».
+fn is_type_page(path: &str) -> bool {
+    if !path.starts_with("objects/") {
+        return false;
+    }
+    let stem = path
+        .rsplit('/')
+        .next()
+        .and_then(|f| f.strip_suffix(".html"))
+        .unwrap_or("");
+    let catalog = stem
+        .strip_prefix("catalog")
+        .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+    !catalog && !path.contains("/formparams/")
+}
+
+/// Английское имя из заголовка «Русское (English.Name)» — последний сегмент.
+fn english_name(title: &str) -> String {
+    title
+        .rsplit_once(" (")
+        .and_then(|(_, en)| en.strip_suffix(')'))
+        .map(|en| en.rsplit('.').next().unwrap_or(en).trim().to_string())
+        .unwrap_or_default()
 }
 
 fn parse_page(path: &str, html: &str) -> Option<Item> {
     let title = tag_text(html, "<h1 class=\"V8SH_pagetitle\">")?;
+    let name_en = english_name(&title);
     let russian_title = title
         .split_once(" (")
         .map(|(ru, _)| ru)
         .unwrap_or(&title)
         .trim()
         .to_string();
+    // Тип не делится на владельца и имя: `ДокументОбъект.<Имя документа>` —
+    // это одно имя типа, а не член `ДокументОбъект`.
+    if !path.contains("/methods/")
+        && !path.contains("/properties/")
+        && !path.contains("/ctors/")
+        && !path.contains("/events/")
+    {
+        let availability = section(html, "Доступность");
+        if availability.is_empty() {
+            return None;
+        }
+        return Some(Item {
+            title: russian_title.clone(),
+            owner: String::new(),
+            name: russian_title,
+            kind: "type".to_string(),
+            syntax: String::new(),
+            description: section(html, "Описание"),
+            availability,
+            example: String::new(),
+            path: path.to_string(),
+            name_en,
+        });
+    }
     let (owner, name) = russian_title
         .rsplit_once('.')
         .map(|(o, n)| (o.to_string(), n.to_string()))
@@ -503,6 +708,7 @@ fn parse_page(path: &str, html: &str) -> Option<Item> {
         availability: section(html, "Доступность"),
         example: section(html, "Пример"),
         path: path.to_string(),
+        name_en,
     })
 }
 
@@ -767,6 +973,61 @@ mod tests {
         assert_eq!(item.syntax, "Вставить(<Ключ>, <Значение>)");
         assert_eq!(item.description, "Добавляет элемент.");
         assert!(!item.availability.contains('<'));
+    }
+
+    /// Разметка снята с настоящей `Query.html` справки 8.3.27.
+    const ЗАПРОС: &str = r#"<h1 class="V8SH_pagetitle">Запрос (Query)</h1><p class="V8SH_title">Запрос (Query)</p><p class="V8SH_chapter">Описание:</p><p>Предназначен для выполнения запросов к базе данных.</p><p class="V8SH_chapter">Доступность: </p><p>Сервер, толстый клиент, внешнее соединение, мобильное приложение (сервер), мобильный автономный сервер.</p><p class="V8SH_chapter">См. также:</p>"#;
+
+    #[test]
+    fn страница_типа_даёт_доступность_типа() {
+        let item = parse_page("objects/catalog213/catalog393/Query.html", ЗАПРОС).unwrap();
+        assert_eq!(item.kind, "type");
+        assert_eq!(item.name, "Запрос");
+        assert!(
+            item.availability.starts_with("Сервер"),
+            "{}",
+            item.availability
+        );
+        assert_eq!(OnThinClient::of(&item.availability), OnThinClient::No);
+    }
+
+    #[test]
+    fn оглавление_и_служебные_страницы_не_типы() {
+        assert!(!is_type_page("objects/catalog213/catalog393.html"));
+        assert!(!is_type_page("objects/catalog125.html"));
+        assert!(!is_type_page("objects/x/formparams/Key97.html"));
+        assert!(is_type_page("objects/catalog213/catalog393/Query.html"));
+        // Страница без раздела «Доступность» — не тип, даже если путь похож.
+        let html = r#"<h1 class="V8SH_pagetitle">Глобальный контекст</h1>"#;
+        assert!(parse_page("objects/Global context.html", html).is_none());
+    }
+
+    #[test]
+    fn контекст_различает_клиент_и_сервер() {
+        let c = context_from_pages(&[
+            ("objects/catalog213/catalog393/Query.html", ЗАПРОС),
+            (
+                "objects/Global context/methods/CurrentSessionDate.html",
+                r#"<h1 class="V8SH_pagetitle">Глобальный контекст.ТекущаяДатаСеанса (CurrentSessionDate)</h1><p class="V8SH_chapter">Доступность:</p><p>Сервер, толстый клиент, внешнее соединение.</p>"#,
+            ),
+            (
+                "objects/Global context/methods/CurrentDate.html",
+                r#"<h1 class="V8SH_pagetitle">Глобальный контекст.ТекущаяДата (CurrentDate)</h1><p class="V8SH_chapter">Доступность:</p><p>Тонкий клиент, веб-клиент, сервер.</p>"#,
+            ),
+        ]);
+        assert_eq!(c.new_type("запрос").unwrap().1, OnThinClient::No);
+        // Английское имя из заголовка — то же значение.
+        assert_eq!(c.new_type("Query").unwrap().1, OnThinClient::No);
+        assert_eq!(
+            c.global_method("CurrentSessionDate").unwrap().1,
+            OnThinClient::No
+        );
+        assert_eq!(
+            c.global_method("ТекущаяДатаСеанса").unwrap().1,
+            OnThinClient::No
+        );
+        assert_eq!(c.global_method("ТекущаяДата").unwrap().1, OnThinClient::Yes);
+        assert!(c.global_method("НетТакого").is_none());
     }
 
     #[test]

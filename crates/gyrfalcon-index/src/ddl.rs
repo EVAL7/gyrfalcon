@@ -31,6 +31,7 @@
 /// | 2 | веха 3: ядро метаданных; в `object_attributes` добавлены квалификаторы |
 /// | 3 | веха 7: `index_meta.git_commit`, индекс `idx_calls_caller` |
 /// | 4 | Р-022: расширения целиком — `extensions`, `extension_objects`; строки расширений во всех таблицах с адресом `../ext/<Имя>/…` |
+/// | 5 | MCP-06: `common_modules` — флаги контекста общих модулей для проверки `check_bsl` |
 ///
 /// Версия 3 совместима со 2 по чтению: столбцов не убавилось, а новый
 /// индекс лишь ускоряет. Поэтому `MIN_READABLE_SCHEMA` не поднят —
@@ -40,7 +41,11 @@
 /// Версия 4 совместима с 3 по чтению: таблицы только добавлены. Индекс
 /// версии 3 читается, но кода расширений в нём нет — это видно по
 /// `schema_version`, и пересборка его возвращает.
-pub const SCHEMA_VERSION: u32 = 4;
+///
+/// Версия 5 совместима с 4 по чтению: добавлена одна таблица. На индексе
+/// версии 4 проверка контекста общих модулей в `check_bsl` не делается и
+/// говорит об этом в ответе, а не молчит.
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Минимальная версия схемы, которую умеет читать этот код.
 ///
@@ -300,6 +305,22 @@ CREATE TABLE IF NOT EXISTS exchange_plan_content (
     auto_record INTEGER NOT NULL,
     path TEXT NOT NULL
 );
+
+-- Флаги общих модулей (схема 5, MCP-06). У прежнего инструмента такой таблицы
+-- нет: флаги живут только в XML, а без них проверка «клиент зовёт серверный
+-- модуль» невозможна. Флаги хранятся числом 0/1, как `use` у заданий.
+CREATE TABLE IF NOT EXISTS common_modules (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    global INTEGER NOT NULL,
+    client_managed INTEGER NOT NULL,
+    client_ordinary INTEGER NOT NULL,
+    server INTEGER NOT NULL,
+    server_call INTEGER NOT NULL,
+    external_connection INTEGER NOT NULL,
+    privileged INTEGER NOT NULL,
+    file TEXT NOT NULL
+);
 "#;
 
 /// Ссылки между объектами метаданных.
@@ -340,6 +361,7 @@ CREATE INDEX IF NOT EXISTS idx_rr_role ON role_rights(role_name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_rr_object ON role_rights(object_name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_epc_plan ON exchange_plan_content(plan_name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_epc_object ON exchange_plan_content(object_ref COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_cm_name ON common_modules(name COLLATE NOCASE);
 "#;
 
 /// Индексы таблиц метаданных. Как и у кода — строго после наполнения.

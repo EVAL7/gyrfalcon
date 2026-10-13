@@ -31,6 +31,7 @@ pub type Result<T> = std::result::Result<T, ParseError>;
 pub mod bsl;
 pub mod module;
 pub mod scan;
+pub mod scope;
 pub mod tokens;
 pub mod usages;
 

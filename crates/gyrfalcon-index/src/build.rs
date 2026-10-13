@@ -61,6 +61,8 @@ pub struct BuildReport {
     pub functional_options: u64,
     pub role_rights: u64,
     pub exchange_plan_content: u64,
+    /// Флаги общих модулей (схема 5): сверх таблиц прежнего инструмента.
+    pub common_modules: u64,
     /// Ссылки между объектами метаданных — надстройка над таблицами выше.
     pub metadata_references: u64,
     /// Интеграция и движения. `register_movements` считает объединение
@@ -941,6 +943,16 @@ fn write_metadata2(
         .collect();
     let opts = без_повторов(opts, |o| &o.file, |o| o.name.to_lowercase(), &mut повторы);
 
+    // Флаги общего модуля задаёт основная конфигурация. Заимствованный в
+    // расширение модуль их не меняет, поэтому повтор по имени отбрасывается
+    // тем же правилом, что у остальных таблиц, — первым идёт основной корень.
+    let common: Vec<meta2::CommonModuleFlags> = файлы("CommonModules")
+        .par_iter()
+        .filter_map(|(_, p)| meta2::parse_common_module(p, &rel_of(src, p)))
+        .collect();
+    let common =
+        без_повторов(common, |m| &m.file, |m| m.name.to_lowercase(), &mut повторы);
+
     let rights: Vec<meta2::RoleRight> = спутники("Roles", "Ext/Rights.xml")
         .par_iter()
         .flat_map(|(role, p)| meta2::parse_role_rights(p, role, &rel_of(src, p)))
@@ -1021,6 +1033,26 @@ fn write_metadata2(
             ])?;
         }
 
+        let mut ins_cm = tx.prepare(
+            "INSERT INTO common_modules
+             (name, global, client_managed, client_ordinary, server, server_call,
+              external_connection, privileged, file)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        )?;
+        for m in &common {
+            ins_cm.execute(rusqlite::params![
+                m.name,
+                i32::from(m.global),
+                i32::from(m.client_managed),
+                i32::from(m.client_ordinary),
+                i32::from(m.server),
+                i32::from(m.server_call),
+                i32::from(m.external_connection),
+                i32::from(m.privileged),
+                m.file,
+            ])?;
+        }
+
         let mut ins_rr = tx.prepare(
             "INSERT INTO role_rights (role_name, object_name, right_name, file)
              VALUES (?1,?2,?3,?4)",
@@ -1052,6 +1084,7 @@ fn write_metadata2(
     report.event_subscriptions = subs.len() as u64;
     report.scheduled_jobs = jobs.len() as u64;
     report.functional_options = opts.len() as u64;
+    report.common_modules = common.len() as u64;
     report.role_rights = rights.len() as u64;
     report.exchange_plan_content = content.len() as u64;
     Ok(())
