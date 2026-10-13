@@ -96,14 +96,24 @@ jobs:
           ./"$exe" --help | head -1 | grep -F "gyrfalcon $VER " \
             || { echo "::error::Бинарь сообщает не $VER"; exit 1; }
           sha=$(sha256sum "$exe" | cut -d' ' -f1)
+          # Скилл — отдельным ассетом, ровно тот, что вшит в бинарь и кладётся
+          # `gyrfalcon install`: для тех, кто ставит его руками или в харнесс,
+          # которого установщик не знает. Отметка обязана нести версию выпуска.
+          skill="gyrfalcon-$TAG-SKILL.md"
+          ./"$exe" skill > "$skill"
+          grep -F "gyrfalcon-stamp version=$VER " "$skill" \
+            || { echo "::error::Скилл в бинаре помечен не версией $VER"; exit 1; }
+          skill_sha=$(sha256sum "$skill" | cut -d' ' -f1)
           cat > notes.md <<EOF
           ⚠️ **Черновик, заведён автоматически.** Перед публикацией:
 
           - [ ] заменить этот текст описанием выпуска;
-          - [ ] после публикации скачать ассет и сверить SHA-256.
+          - [ ] после публикации скачать ассеты и сверить SHA-256.
 
           \`$exe\` — SHA-256 \`$sha\` (собран в CI, windows-latest)
+
+          \`$skill\` — SHA-256 \`$skill_sha\` (скилл этой версии; \`gyrfalcon install\` кладёт его сам)
           EOF
-          gh release create "$TAG" "$exe" --draft --verify-tag \
+          gh release create "$TAG" "$exe" "$skill" --draft --verify-tag \
             --title "$TAG" --notes-file notes.md
           echo "Заведён черновик релиза $TAG"
