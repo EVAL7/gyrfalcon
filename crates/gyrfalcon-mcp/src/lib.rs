@@ -9,6 +9,7 @@ pub mod assist_bsl;
 pub mod autoupdate;
 pub mod changes;
 pub mod check_bsl;
+pub mod check_scope;
 pub mod freshness_guard;
 pub mod grep;
 pub mod hooks;

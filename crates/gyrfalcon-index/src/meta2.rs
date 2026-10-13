@@ -84,6 +84,29 @@ pub struct ExchangeContentItem {
     pub path: String,
 }
 
+/// Флаги общего модуля: где его код существует и откуда его можно звать.
+///
+/// Нужны проверке контекста исполнения (`check_bsl`, MCP-06): вызов из
+/// `&НаКлиенте` в модуль без клиентского флага и без `ServerCall` платформа
+/// не компилирует, а по одному тексту модуля это не видно — флаги живут
+/// только в XML. Класс ошибки из живой задачи: клиентский вызов серверного
+/// метода прошёл все проверки агента и вылез у пользователя при запуске.
+///
+/// Имена полей — имена тегов выгрузки (сверено с `CommonModules/*.xml` БП
+/// 13.10.2026), без перевода.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommonModuleFlags {
+    pub name: String,
+    pub global: bool,
+    pub client_managed: bool,
+    pub client_ordinary: bool,
+    pub server: bool,
+    pub server_call: bool,
+    pub external_connection: bool,
+    pub privileged: bool,
+    pub file: String,
+}
+
 /// Прочитать файл, сняв BOM. `None` — файла нет или он нечитаем.
 fn read_text(path: &Path) -> Option<String> {
     let raw = std::fs::read(path).ok()?;
@@ -232,6 +255,29 @@ pub fn parse_scheduled_job(path: &Path, rel: &str) -> Option<ScheduledJob> {
         restart_interval: direct_prop(&pairs, "RestartIntervalOnFailure")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
+        file: rel.to_string(),
+    })
+}
+
+/// Разобрать флаги общего модуля.
+///
+/// Отсутствующий флаг читается как `false` — так платформа и выгружает
+/// умолчание. Но объект без `<Name>` отвергается: модуль без имени в таблице
+/// был бы строкой, на которую нельзя сослаться.
+pub fn parse_common_module(path: &Path, rel: &str) -> Option<CommonModuleFlags> {
+    let text = read_text(path)?;
+    let pairs = properties_pairs(&text);
+    let name = direct_prop(&pairs, "Name")?;
+    let flag = |tag: &str| direct_prop(&pairs, tag).as_deref() == Some("true");
+    Some(CommonModuleFlags {
+        name,
+        global: flag("Global"),
+        client_managed: flag("ClientManagedApplication"),
+        client_ordinary: flag("ClientOrdinaryApplication"),
+        server: flag("Server"),
+        server_call: flag("ServerCall"),
+        external_connection: flag("ExternalConnection"),
+        privileged: flag("Privileged"),
         file: rel.to_string(),
     })
 }
@@ -447,6 +493,47 @@ mod tests {
         let p = во_временный("sub-multi.xml", &xml);
         let s = parse_event_subscription(&p, "x.xml").unwrap();
         assert_eq!(s.source_types.len(), 3);
+    }
+
+    #[test]
+    fn общий_модуль_читает_флаги_контекста() {
+        // Форма снята с `CommonModules/ОбщегоНазначенияВызовСервера.xml` БП.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject xmlns:v8="http://v8.1c.ru/8.1/data/core">
+  <CommonModule uuid="1c0d">
+    <Properties>
+      <Name>ОбщегоНазначенияВызовСервера</Name>
+      <Synonym/>
+      <Comment/>
+      <Global>false</Global>
+      <ClientManagedApplication>false</ClientManagedApplication>
+      <Server>true</Server>
+      <ExternalConnection>false</ExternalConnection>
+      <ClientOrdinaryApplication>false</ClientOrdinaryApplication>
+      <ServerCall>true</ServerCall>
+      <Privileged>false</Privileged>
+      <ReturnValuesReuse>DontUse</ReturnValuesReuse>
+    </Properties>
+  </CommonModule>
+</MetaDataObject>"#;
+        let p = во_временный("cm.xml", xml);
+        let m = parse_common_module(&p, "CommonModules/ОбщегоНазначенияВызовСервера.xml").unwrap();
+        assert_eq!(m.name, "ОбщегоНазначенияВызовСервера");
+        assert!(m.server && m.server_call, "серверные флаги потеряны: {m:?}");
+        assert!(!m.client_managed && !m.global && !m.privileged);
+    }
+
+    #[test]
+    fn общий_модуль_без_флага_читается_как_ложь() {
+        // Отсутствующий тег — умолчание платформы `false`, а не «неизвестно».
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MetaDataObject><CommonModule uuid="1"><Properties>
+<Name>Клиентский</Name><ClientManagedApplication>true</ClientManagedApplication>
+</Properties></CommonModule></MetaDataObject>"#;
+        let p = во_временный("cm-short.xml", xml);
+        let m = parse_common_module(&p, "x.xml").unwrap();
+        assert!(m.client_managed);
+        assert!(!m.server && !m.server_call);
     }
 
     #[test]

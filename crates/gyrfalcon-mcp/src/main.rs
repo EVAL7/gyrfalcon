@@ -942,6 +942,7 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     println!("  функц. опции  {:>9}", r.functional_options);
     println!("  права ролей   {:>9}", r.role_rights);
     println!("  состав обмена {:>9}", r.exchange_plan_content);
+    println!("  общие модули  {:>9}", r.common_modules);
     println!("  ссылки        {:>9}", r.metadata_references);
     println!(
         "  движения рег. {:>9}  (объявленные; кодовые — с вехой usages)",

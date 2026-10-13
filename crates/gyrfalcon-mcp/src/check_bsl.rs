@@ -49,8 +49,20 @@ const FRAGMENT_CHARS: usize = 120;
 /// сочинение замены — нет.
 const SUGGEST: usize = 3;
 
-/// Проверить модуль: структура по AST + имена по индексу.
+/// Проверить модуль: структура по AST + имена по индексу + переменные и
+/// контекст исполнения по справке платформы.
 pub fn check_bsl(conn: &Connection, args: &Value) -> Result<Value, String> {
+    check_bsl_with(conn, args, crate::platform_help::context())
+}
+
+/// То же с явно переданной справкой платформы. Отдельно ради тестов: на CI
+/// установленной 1С нет, и проверка не должна зависеть от машины, на
+/// которой её гоняют.
+pub fn check_bsl_with(
+    conn: &Connection,
+    args: &Value,
+    platform: Result<&crate::platform_help::PlatformContext, String>,
+) -> Result<Value, String> {
     let source = args
         .get("source")
         .and_then(Value::as_str)
@@ -61,6 +73,7 @@ pub fn check_bsl(conn: &Connection, args: &Value) -> Result<Value, String> {
         .map(|n| (n as usize).clamp(1, MAX_LIMIT))
         .unwrap_or(DEFAULT_LIMIT);
     let deep = args.get("deep").and_then(Value::as_bool).unwrap_or(false);
+    let module = args.get("module").and_then(Value::as_str);
 
     let mut issues = Vec::new();
 
@@ -101,7 +114,16 @@ pub fn check_bsl(conn: &Connection, args: &Value) -> Result<Value, String> {
     let parsed = module::parse(source).map_err(|e| format!("разбор не состоялся: {e}"))?;
     let (проверено, пропущено) = проверить_имена(conn, &parsed, &mut issues)?;
 
-    issues.sort_by_key(|i| i["line"].as_u64().unwrap_or(0));
+    // --- Слой 3: переменные и контекст исполнения (MCP-06). ---
+    let область = crate::check_scope::check(conn, source, module, platform)?;
+    issues.extend(область.issues);
+
+    issues.sort_by_key(|i| {
+        (
+            i["line"].as_u64().unwrap_or(0),
+            i["column"].as_u64().unwrap_or(0),
+        )
+    });
     let всего = issues.len();
     issues.truncate(limit);
 
@@ -111,7 +133,13 @@ pub fn check_bsl(conn: &Connection, args: &Value) -> Result<Value, String> {
         "total": всего,
         "checked_calls": проверено,
         "skipped_calls": пропущено,
+        "checked_names": область.checked_names,
+        "checked_client_methods": область.checked_client_methods,
+        "attributes_from": область.attributes_from,
     });
+    if !область.skipped.is_empty() {
+        out["not_checked"] = json!(область.skipped);
+    }
     if всего > issues.len() {
         out["truncated"] = json!(всего - issues.len());
     }
@@ -121,7 +149,10 @@ pub fn check_bsl(conn: &Connection, args: &Value) -> Result<Value, String> {
         "Проверены структура кода и имена в вызовах «Модуль.Метод», где Модуль — объект этой \
          конфигурации: {проверено} шт. Пропущено {пропущено} вызовов — встроенные функции \
          платформы, методы её типов и обращения через переменные: индекс о них не знает, и \
-         «не найдено» про них было бы ложью. Текст ЗАПРОСА здесь не проверяется — это \
+         «не найдено» про них было бы ложью. Неопределённые переменные и недоступное на \
+         клиенте проверены по справке платформы, кроме кода под #Если; что не проверено — \
+         в not_checked. Реквизиты формы и объекта сверяются точно, только если передан \
+         module (attributes_from=module). Текст ЗАПРОСА здесь не проверяется — это \
          query_check канала данных."
     ));
     if deep {
@@ -455,6 +486,12 @@ pub fn schema() -> Value {
                 "Конфигурация 1С, по которой сверять имена. Обязателен, когда сервер \
                  обслуживает несколько (см. list_projects)"
             },
+            "module": {
+                "type": "string",
+                "description": "Путь модуля в выгрузке (например Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl). \
+                 С ним реквизиты формы или объекта сверяются точно, а методы клиентского общего \
+                 модуля проверяются как клиентские. Без него — сверка с реквизитами всей конфигурации"
+            },
             "limit": {
                 "type": "integer",
                 "default": DEFAULT_LIMIT,
@@ -492,8 +529,340 @@ mod tests {
         c
     }
 
+    /// Слои 1–2 без справки платформы: так тесты не зависят от того,
+    /// установлена ли 1С на машине, где их гоняют.
     fn проверить(src: &str) -> Value {
-        check_bsl(&индекс(), &json!({ "source": src })).unwrap()
+        check_bsl_with(
+            &индекс(),
+            &json!({ "source": src }),
+            Err("нет справки в тесте".into()),
+        )
+        .unwrap()
+    }
+
+    // --- слой 3: переменные и контекст исполнения (MCP-06) ---
+
+    /// Индекс схемы 5: общие модули с флагами, реквизиты формы и объекта.
+    fn индекс5() -> Connection {
+        let c = индекс();
+        c.execute_batch(
+            "ALTER TABLE modules ADD COLUMN rel_path TEXT;
+             ALTER TABLE modules ADD COLUMN category TEXT;
+             UPDATE modules SET rel_path='CommonModules/ОбщегоНазначения/Ext/Module.bsl', category='CommonModules' WHERE id=1;
+             INSERT INTO modules VALUES (2, 'СерверныйМодуль', 'CommonModules/СерверныйМодуль/Ext/Module.bsl', 'CommonModules');
+             INSERT INTO modules VALUES (3, 'МодульВызовСервера', 'CommonModules/МодульВызовСервера/Ext/Module.bsl', 'CommonModules');
+             INSERT INTO modules VALUES (4, 'Заказ', 'Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl', 'Documents');
+             INSERT INTO methods VALUES (10, 2, 'Посчитать', '()'), (11, 3, 'Посчитать', '()');
+             CREATE TABLE common_modules(id INTEGER PRIMARY KEY, name TEXT, global INTEGER, client_managed INTEGER,
+               client_ordinary INTEGER, server INTEGER, server_call INTEGER, external_connection INTEGER,
+               privileged INTEGER, file TEXT);
+             INSERT INTO common_modules VALUES
+               (1, 'ОбщегоНазначения', 0, 1, 1, 1, 0, 1, 0, ''),
+               (2, 'СерверныйМодуль', 0, 0, 0, 1, 0, 1, 0, ''),
+               (3, 'МодульВызовСервера', 0, 0, 0, 1, 1, 0, 0, '');
+             CREATE TABLE form_elements(object_name TEXT, form_name TEXT, kind TEXT, element_name TEXT, file TEXT);
+             INSERT INTO form_elements VALUES
+               ('Заказ', 'ФормаДокумента', 'attribute', 'Объект', 'Documents/Заказ/Forms/ФормаДокумента/Ext/Form.xml'),
+               ('Заказ', 'ФормаДокумента', 'attribute', 'ВыбранныйСклад', 'Documents/Заказ/Forms/ФормаДокумента/Ext/Form.xml');
+             CREATE TABLE object_attributes(object_name TEXT, category TEXT, attr_name TEXT, attr_kind TEXT, ts_name TEXT);
+             INSERT INTO object_attributes VALUES ('Заказ', 'Documents', 'Контрагент', 'attribute', NULL);
+             CREATE TABLE enum_values(name TEXT, values_json TEXT);
+             INSERT INTO enum_values VALUES ('Важность', '[\"Высокая\", \"Низкая\"]');",
+        )
+        .unwrap();
+        c
+    }
+
+    /// Справка платформы в миниатюре: разметка страниц — как в 8.3.27.
+    fn справка() -> crate::platform_help::PlatformContext {
+        let стр = |заголовок: &str, доступность: &str| {
+            format!(
+                "<h1 class=\"V8SH_pagetitle\">{заголовок}</h1><p class=\"V8SH_chapter\">Доступность:</p><p>{доступность}</p>"
+            )
+        };
+        let запрос = стр(
+            "Запрос (Query)",
+            "Сервер, толстый клиент, внешнее соединение.",
+        );
+        let массив = стр(
+            "Массив (Array)",
+            "Тонкий клиент, веб-клиент, сервер, толстый клиент.",
+        );
+        let тдс = стр(
+            "Глобальный контекст.ТекущаяДатаСеанса (CurrentSessionDate)",
+            "Сервер, толстый клиент, внешнее соединение.",
+        );
+        let сообщить = стр(
+            "Глобальный контекст.Сообщить (Message)",
+            "Тонкий клиент, веб-клиент, сервер, толстый клиент.",
+        );
+        let справочники = стр(
+            "Глобальный контекст.Справочники (Catalogs)",
+            "Сервер, толстый клиент, внешнее соединение.",
+        );
+        let элементы = стр(
+            "ФормаКлиентскогоПриложения.Элементы (Items)",
+            "Тонкий клиент, веб-клиент, сервер, толстый клиент.",
+        );
+        crate::platform_help::context_from_pages(&[
+            ("objects/c1/Query.html", запрос.as_str()),
+            ("objects/c1/Array.html", массив.as_str()),
+            (
+                "objects/Global context/methods/CurrentSessionDate.html",
+                тдс.as_str(),
+            ),
+            (
+                "objects/Global context/methods/Message.html",
+                сообщить.as_str(),
+            ),
+            (
+                "objects/Global context/properties/Catalogs.html",
+                справочники.as_str(),
+            ),
+            (
+                "objects/ManagedForm/properties/Items.html",
+                элементы.as_str(),
+            ),
+        ])
+    }
+
+    fn проверить3(src: &str, module: Option<&str>) -> Value {
+        let п = справка();
+        let mut args = json!({ "source": src });
+        if let Some(m) = module {
+            args["module"] = json!(m);
+        }
+        check_bsl_with(&индекс5(), &args, Ok(&п)).unwrap()
+    }
+
+    fn замечания(v: &Value, kind: &str) -> Vec<Value> {
+        v["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["kind"] == json!(kind))
+            .cloned()
+            .collect()
+    }
+
+    /// Калибровка 09.10.2026 дословно (без первой строки модуля).
+    const КАЛИБРОВКА: &str = "&НаСервере
+Процедура КалибровкаНаСервере()
+\tРезультат = НеОпределённаяПеременнаяКалибровки + 1;
+КонецПроцедуры
+
+&НаКлиенте
+Процедура КалибровкаНаКлиенте(Команда)
+\tЗапрос = Новый Запрос(\"ВЫБРАТЬ 1\");
+\tКалибровкаНаСервере();
+КонецПроцедуры
+";
+
+    #[test]
+    fn калибровка_неопределённая_переменная_с_позицией() {
+        let v = проверить3(КАЛИБРОВКА, None);
+        let u = замечания(&v, "undefined_variable");
+        assert_eq!(u.len(), 1, "{v}");
+        assert_eq!(
+            (u[0]["line"].as_u64(), u[0]["column"].as_u64()),
+            (Some(3), Some(14))
+        );
+        assert!(u[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("НеОпределённаяПеременнаяКалибровки"));
+    }
+
+    #[test]
+    fn калибровка_серверный_тип_на_клиенте_с_позицией() {
+        let v = проверить3(КАЛИБРОВКА, None);
+        let c = замечания(&v, "client_context");
+        assert_eq!(c.len(), 1, "{v}");
+        assert_eq!(
+            (c[0]["line"].as_u64(), c[0]["column"].as_u64()),
+            (Some(8), Some(17))
+        );
+        assert!(c[0]["message"].as_str().unwrap().contains("Запрос"));
+        assert_eq!(v["ok"], json!(false));
+    }
+
+    #[test]
+    fn клиентский_тип_на_клиенте_не_ошибка() {
+        let v = проверить3(
+            "&НаКлиенте\nПроцедура П()\n\tМ = Новый Массив;\n\tСообщить(\"х\");\nКонецПроцедуры\n",
+            None,
+        );
+        assert_eq!(v["ok"], json!(true), "{v}");
+    }
+
+    #[test]
+    fn серверный_модуль_с_клиента_ловится_а_вызов_сервера_нет() {
+        // Класс живой задачи: клиентский вызов серверного прошёл все проверки агента.
+        let v = проверить3(
+            "&НаКлиенте\nПроцедура П()\n\tСерверныйМодуль.Посчитать();\n\tМодульВызовСервера.Посчитать();\n\tОбщегоНазначения.СообщитьПользователю(\"х\");\nКонецПроцедуры\n",
+            None,
+        );
+        let c = замечания(&v, "client_context");
+        assert_eq!(c.len(), 1, "{v}");
+        assert!(c[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("СерверныйМодуль"));
+    }
+
+    #[test]
+    fn серверный_глобальный_метод_и_свойство_на_клиенте() {
+        let v = проверить3(
+            "&НаКлиенте\nПроцедура П()\n\tД = ТекущаяДатаСеанса();\n\tС = Справочники.Номенклатура;\nКонецПроцедуры\n",
+            None,
+        );
+        assert_eq!(замечания(&v, "client_context").len(), 2, "{v}");
+    }
+
+    #[test]
+    fn реквизит_формы_затеняет_глобальное_свойство() {
+        // Живой случай БП: реквизит формы `РабочаяДата` на клиенте — не
+        // серверное свойство глобального контекста. Здесь в роли
+        // «серверного свойства» — `Справочники`, в роли реквизита — оно же.
+        let c = индекс5();
+        c.execute_batch(
+            "INSERT INTO form_elements VALUES ('Заказ', 'ФормаДокумента', 'attribute', 'Справочники',
+               'Documents/Заказ/Forms/ФормаДокумента/Ext/Form.xml');",
+        )
+        .unwrap();
+        let п = справка();
+        let v = check_bsl_with(
+            &c,
+            &json!({"source": "&НаКлиенте\nПроцедура П()\n\tХ = Справочники;\nКонецПроцедуры\n",
+                    "module": "Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl"}),
+            Ok(&п),
+        )
+        .unwrap();
+        assert_eq!(v["ok"], json!(true), "{v}");
+    }
+
+    #[test]
+    fn предопределённое_голым_именем_в_модуле_менеджера() {
+        let c = индекс5();
+        c.execute_batch(
+            "ALTER TABLE predefined_items ADD COLUMN object_name TEXT;
+             ALTER TABLE predefined_items ADD COLUMN category TEXT;
+             INSERT INTO predefined_items VALUES (2, 'ПрочиеНалоги', 'ВидыНалогов', 'Catalogs');
+             INSERT INTO modules VALUES (5, 'ВидыНалогов', 'Catalogs/ВидыНалогов/Ext/ManagerModule.bsl', 'Catalogs');",
+        )
+        .unwrap();
+        let п = справка();
+        let v = check_bsl_with(
+            &c,
+            &json!({"source": "Функция Ф()\n\tВозврат ПрочиеНалоги;\nКонецФункции\n",
+                    "module": "Catalogs/ВидыНалогов/Ext/ManagerModule.bsl"}),
+            Ok(&п),
+        )
+        .unwrap();
+        assert_eq!(v["ok"], json!(true), "{v}");
+    }
+
+    #[test]
+    fn значение_перечисления_голым_именем_и_без_модуля() {
+        // Режим объединения обязан знать значения перечислений: в модуле
+        // менеджера перечисления они — голые имена (420 ложных на ДО 13.10.2026).
+        let v = проверить3("Функция Ф()\n\tВозврат Высокая;\nКонецФункции\n", None);
+        assert_eq!(v["ok"], json!(true), "{v}");
+        assert_eq!(v["attributes_from"], json!("union"));
+    }
+
+    #[test]
+    fn тот_же_код_на_сервере_молчит() {
+        let v = проверить3(
+            "&НаСервере\nПроцедура П()\n\tД = ТекущаяДатаСеанса();\n\tЗ = Новый Запрос;\n\tСерверныйМодуль.Посчитать();\nКонецПроцедуры\n",
+            None,
+        );
+        assert_eq!(v["ok"], json!(true), "{v}");
+    }
+
+    #[test]
+    fn код_под_если_не_проверяется_на_контекст() {
+        let v = проверить3(
+            "&НаКлиенте\nПроцедура П()\n#Если ТолстыйКлиентОбычноеПриложение Тогда\n\tЗ = Новый Запрос;\n#КонецЕсли\nКонецПроцедуры\n",
+            None,
+        );
+        assert!(замечания(&v, "client_context").is_empty(), "{v}");
+    }
+
+    #[test]
+    fn реквизиты_формы_точно_по_модулю() {
+        let src = "&НаКлиенте\nПроцедура П()\n\tЭлементы.Склад.Видимость = ЗначениеЗаполнено(ВыбранныйСклад);\n\tХ = Объект.Ссылка;\nКонецПроцедуры\n";
+        let v = проверить3(
+            src,
+            Some("Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl"),
+        );
+        assert_eq!(v["ok"], json!(true), "{v}");
+        assert_eq!(v["attributes_from"], json!("module"));
+        // Реквизит чужого объекта в форме — неопределённая переменная.
+        let v = проверить3(
+            "&НаКлиенте\nПроцедура П()\n\tХ = Контрагент;\nКонецПроцедуры\n",
+            Some("Documents/Заказ/Forms/ФормаДокумента/Ext/Form/Module.bsl"),
+        );
+        assert_eq!(замечания(&v, "undefined_variable").len(), 1, "{v}");
+    }
+
+    #[test]
+    fn без_модуля_сверка_с_объединением_реквизитов() {
+        // Без module тот же код молчит: Контрагент есть в конфигурации.
+        let v = проверить3(
+            "&НаКлиенте\nПроцедура П()\n\tХ = Контрагент;\nКонецПроцедуры\n",
+            None,
+        );
+        assert_eq!(v["ok"], json!(true), "{v}");
+        assert_eq!(v["attributes_from"], json!("union"));
+    }
+
+    #[test]
+    fn объявленное_и_модульное_не_ошибка() {
+        let src = "Перем МодульнаяПеременная;\n\nФункция Ф(П1, П2 = 5)\n\tПерем Л;\n\tДля Сч = 1 По 3 Цикл\n\t\tЛ = Сч;\n\tКонецЦикла;\n\tВозврат П1 + П2 + Л + МодульнаяПеременная + ОбщегоНазначения.ЗначениеРеквизитаОбъекта(1, 2);\nКонецФункции\n";
+        let v = проверить3(src, None);
+        assert_eq!(v["ok"], json!(true), "{v}");
+    }
+
+    #[test]
+    fn без_справки_слой_честно_не_проверяет() {
+        let v = проверить("Процедура П()\n\tХ = НетТакой;\nКонецПроцедуры\n");
+        assert_eq!(v["ok"], json!(true));
+        let nc = v["not_checked"].as_array().unwrap();
+        assert!(nc[0].as_str().unwrap().contains("справка платформы"), "{v}");
+    }
+
+    #[test]
+    fn старый_индекс_без_флагов_говорит_об_этом() {
+        let п = справка();
+        let v = check_bsl_with(
+            &индекс_без_флагов(),
+            &json!({"source": "&НаКлиенте\nПроцедура П()\n\tСерверныйМодуль.Посчитать();\nКонецПроцедуры\n"}),
+            Ok(&п),
+        )
+        .unwrap();
+        let nc = v["not_checked"].as_array().unwrap();
+        assert!(
+            nc.iter()
+                .any(|x| x.as_str().unwrap().contains("схема ниже 5")),
+            "{v}"
+        );
+    }
+
+    fn индекс_без_флагов() -> Connection {
+        let c = индекс5();
+        c.execute_batch("DROP TABLE common_modules;").unwrap();
+        c
+    }
+
+    #[test]
+    fn битая_структура_глушит_слой_3() {
+        let v = проверить3(
+            "Процедура П()\n\tЕсли А = 1\n\tХ = НетТакой;\nКонецПроцедуры\n",
+            None,
+        );
+        assert!(замечания(&v, "undefined_variable").is_empty(), "{v}");
+        assert!(!замечания(&v, "syntax").is_empty(), "{v}");
     }
 
     fn виды(v: &Value) -> Vec<String> {
@@ -516,7 +885,7 @@ mod tests {
 
     #[test]
     fn глубокий_режим_выдаёт_метрики_сложности() {
-        let v = check_bsl(&индекс(), &json!({"source": "Процедура Т()\nЕсли Истина Тогда\nДля Н = 1 По 2 Цикл\nКонецЦикла;\nКонецЕсли;\nКонецПроцедуры", "deep": true})).unwrap();
+        let v = check_bsl_with(&индекс(), &json!({"source": "Процедура Т()\nЕсли Истина Тогда\nДля Н = 1 По 2 Цикл\nКонецЦикла;\nКонецЕсли;\nКонецПроцедуры", "deep": true}), Err("нет справки в тесте".into())).unwrap();
         assert_eq!(v["complexity"]["cyclomatic"], json!(3));
         assert_eq!(v["complexity"]["max_nesting"], json!(2));
     }
@@ -650,7 +1019,12 @@ mod tests {
     fn лимит_режет_и_считает_остаток() {
         let битый =
             "Процедура Т()\n\tА = (1));\n\tБ = (2));\n\tВ = (3));\n\tГ = (4));\nКонецПроцедуры\n";
-        let v = check_bsl(&индекс(), &json!({ "source": битый, "limit": 2 })).unwrap();
+        let v = check_bsl_with(
+            &индекс(),
+            &json!({ "source": битый, "limit": 2 }),
+            Err("нет справки в тесте".into()),
+        )
+        .unwrap();
         assert_eq!(v["total"], json!(4));
         assert_eq!(v["issues"].as_array().unwrap().len(), 2);
         assert_eq!(v["truncated"], json!(2));
