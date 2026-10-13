@@ -33,6 +33,12 @@ LABEL org.opencontainers.image.title="gyrfalcon" \
       org.opencontainers.image.source="https://github.com/aleksandrgradoboev-svg/gyrfalcon" \
       org.opencontainers.image.licenses="MIT"
 
+# git нужен серверу на месте исполнения — без него не работает всё,
+# что смотрит в рабочую копию репозитория.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git \
+ && rm -rf /var/lib/apt/lists/*
+
 # Пользователь без прав: сервер только читает — индекс открывается
 # read-only, в конфигурацию он не пишет, в сеть не ходит. Root ему не нужен
 # ни для чего, а собранный индекс, наоборот, должен быть ему читаем: при
