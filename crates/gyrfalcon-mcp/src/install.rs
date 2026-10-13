@@ -76,9 +76,24 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ОТМЕТКА: &str = "gyrfalcon-stamp";
 
 /// Хэш тела — первые 16 знаков SHA-256: для «правили или нет» хватает.
+///
+/// Считается по тексту с переводами строк, приведёнными к LF: git с
+/// `core.autocrlf=true` выгружает файл в CRLF, и это не правка человека.
+/// В 0.1.16 хэш был чувствителен к CRLF, и после такой выгрузки `install`
+/// считал нетронутый скилл правленным и переставал его обновлять.
 fn хэш(тело: &str) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(тело.as_bytes()))[..16].to_string()
+    let lf = к_lf(тело);
+    format!("{:x}", Sha256::digest(lf.as_bytes()))[..16].to_string()
+}
+
+/// Переводы строк — к LF. Одиночный `\r` в наших текстах не встречается.
+fn к_lf(текст: &str) -> std::borrow::Cow<'_, str> {
+    if текст.contains('\r') {
+        std::borrow::Cow::Owned(текст.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(текст)
+    }
 }
 
 /// Тело + строка-отметка. Markdown получает HTML-комментарий (не виден
@@ -108,7 +123,9 @@ pub fn состояние(текст: &str) -> Состояние {
     // Отметка ищется в ЛЮБОЙ строке, а не только в последней: человек мог
     // дописать заметку ниже неё (живая проба 13.10.2026 — без этого файл
     // был защищён верно, но с ложным «без отметки»). Текст после отметки —
-    // тоже правка.
+    // тоже правка. Разбор — по тексту в LF (см. `хэш`).
+    let текст = к_lf(текст);
+    let текст = текст.as_ref();
     let Some(начало) = текст.rfind(ОТМЕТКА) else {
         return Состояние::БезОтметки;
     };
@@ -592,7 +609,8 @@ fn записать(куда: &Path, что: &str, force: bool) -> std::io::Resu
     let mut итог_замены = None;
     if куда.exists() && !force {
         let текущий = std::fs::read_to_string(куда).unwrap_or_default();
-        if текущий == что {
+        // Тот же текст в CRLF (выгрузка git на Windows) — тот же файл.
+        if к_lf(&текущий) == к_lf(что) {
             return Ok("уже актуален".into());
         }
         match состояние(&текущий) {
@@ -796,6 +814,38 @@ mod tests {
         let итог = записать(&путь, &skill_with_stamp(), false).unwrap();
         assert!(итог.starts_with("обновлён с 0.0.1"), "{итог}");
         assert_eq!(std::fs::read_to_string(&путь).unwrap(), skill_with_stamp());
+    }
+
+    #[test]
+    fn crlf_после_выгрузки_git_не_делает_файл_правленным() {
+        // git с `core.autocrlf=true` на Windows выгружает файл в CRLF. Это
+        // не правка человека: отметка обязана читаться так же, как в LF,
+        // иначе `install` перестаёт обновлять скилл ровно на Windows
+        // (дефект 0.1.16, найден по предупреждению git 13.10.2026).
+        let lf = с_отметкой("строка один\nстрока два\n", false);
+        let crlf = lf.replace('\n', "\r\n");
+        assert_eq!(
+            состояние(&crlf),
+            Состояние::Нетронут {
+                версия: VERSION.to_string()
+            },
+            "{crlf:?}"
+        );
+        // Файл той же версии в CRLF — «уже актуален», а не перезапись.
+        let путь = временный("crlf-same");
+        std::fs::write(&путь, skill_with_stamp().replace('\n', "\r\n")).unwrap();
+        assert_eq!(
+            записать(&путь, &skill_with_stamp(), false).unwrap(),
+            "уже актуален"
+        );
+        // Прежняя версия в CRLF — обновляется сама, как в LF.
+        let путь = временный("crlf-old");
+        let старый = с_отметкой("старый\n", false)
+            .replace(VERSION, "0.0.1")
+            .replace('\n', "\r\n");
+        std::fs::write(&путь, &старый).unwrap();
+        let итог = записать(&путь, &skill_with_stamp(), false).unwrap();
+        assert!(итог.starts_with("обновлён с 0.0.1"), "{итог}");
     }
 
     #[test]
