@@ -1145,21 +1145,68 @@ fn опции_объекта(
 /// Источник — тип объекта: вид плюс суффикс (`DocumentObject.X`,
 /// `InformationRegisterRecordSet.X`, `ConstantValueManager.X`). Суффикс
 /// сверяется по закрытому списку: иначе `Document` совпал бы с началом
-/// `DocumentJournal`. Источники через определяемый тип не развёрнуты (п. 7).
+/// `DocumentJournal`.
+///
+/// Источник `DefinedType.X` разворачивается по `defined_types`: там состав
+/// без суффикса (`Document.X`), поэтому и сверка — без него. В столбце `via`
+/// — через какой определяемый тип подписка достала объект; пусто — объект
+/// назван источником напрямую.
 fn подписки_объекта(
     conn: &Connection,
     имя: &str,
     виды: &[&str],
 ) -> Result<Value, String> {
     const СУФФИКСЫ: [&str; 4] = ["Object", "RecordSet", "Manager", "ValueManager"];
+    let наш_тип = |тип: &str| {
+        виды.iter().any(|вид| {
+            тип
+                .strip_prefix(вид)
+                .is_some_and(|суф| СУФФИКСЫ.contains(&суф))
+        })
+    };
+    let прямо = |ист: &str| {
+        ист
+            .split_once('.')
+            .is_some_and(|(тип, хвост)| хвост == имя && наш_тип(тип))
+    };
+    // Источник без имени (`DocumentObject`) — подписка на ВСЕ объекты вида:
+    // так в типовых устроены, например, проверки дополнительных реквизитов.
+    // На УТ таких подписок 47; до 0.1.19 они не имели источников вовсе.
+    let весь_вид = |ист: &str| !ист.contains('.') && наш_тип(ист);
+
+    // Определяемые типы, в составе которых есть объект (`Document.X`).
+    let полные: Vec<String> = виды.iter().map(|вид| format!("{вид}.{имя}")).collect();
+    let mut st = conn
+        .prepare(
+            "SELECT name, type_refs_json FROM defined_types WHERE instr(type_refs_json, ?1) > 0",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut через: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for запись in st
+        .query_map([имя], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+    {
+        let (тип, состав) = запись.map_err(|e| e.to_string())?;
+        let состав: Vec<String> = состав
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        if состав.iter().any(|эл| полные.contains(эл)) {
+            через.insert(format!("DefinedType.{тип}"));
+        }
+    }
+
     let mut st = conn
         .prepare(
             "SELECT name, event, handler_module, handler_procedure, source_types, file
-             FROM event_subscriptions WHERE instr(source_types, ?1) > 0 ORDER BY name",
+             FROM event_subscriptions ORDER BY name",
         )
         .map_err(|e| e.to_string())?;
+    // Без отбора в SQL: у подписки на весь вид имени объекта в источниках
+    // нет, а подписок в конфигурации сотни (на УТ 300) — перебор дешёвый.
     let кандидаты = st
-        .query_map([имя], |r| {
+        .query_map([], |r| {
             Ok((
                 [0, 1, 2, 3, 4, 5].map(|i| значение(r, i)),
                 r.get::<_, Option<String>>(4)?,
@@ -1167,27 +1214,31 @@ fn подписки_объекта(
         })
         .map_err(|e| e.to_string())?;
     let mut строки = Vec::new();
-    for к in кандидаты {
-        let (поля, источники) = к.map_err(|e| e.to_string())?;
+    for кандидат in кандидаты {
+        let (поля, источники) = кандидат.map_err(|e| e.to_string())?;
         let источники: Vec<String> = источники
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        let наш = источники.iter().any(|ист| {
-            ист.split_once('.').is_some_and(|(тип, хвост)| {
-                хвост == имя
-                    && виды.iter().any(|вид| {
-                        тип
-                            .strip_prefix(вид)
-                            .is_some_and(|суф| СУФФИКСЫ.contains(&суф))
-                    })
-            })
-        });
-        if наш {
-            строки.push(json!(поля));
+        // Прямое имя важнее определяемого типа, тот — подписки на весь вид.
+        let via = if источники.iter().any(|ист| прямо(ист)) {
+            Some(Value::Null)
+        } else if let Some(ист) = источники.iter().find(|ист| через.contains(*ист))
+        {
+            Some(json!(ист))
+        } else {
+            источники
+                .iter()
+                .find(|ист| весь_вид(ист))
+                .map(|ист| json!(format!("{ист}: все объекты вида")))
+        };
+        if let Some(via) = via {
+            let mut строка = поля.to_vec();
+            строка.push(via);
+            строки.push(Value::Array(строка));
         }
     }
     Ok(json!({
-        "columns": ["name", "event", "handler_module", "handler_procedure", "source_types", "file"],
+        "columns": ["name", "event", "handler_module", "handler_procedure", "source_types", "file", "via"],
         "count": строки.len(),
         "rows": строки,
     }))
@@ -2288,6 +2339,52 @@ mod tests {
         );
         assert_eq!(v["subscriptions"]["rows"][0][0], "ПередЗаписьюРеализации");
         assert!(v.get("empty_parts").is_none(), "{v:#}");
+    }
+
+    /// Подписка с источником-определяемым типом находится по объекту из его
+    /// состава (п. 7) — и только по нему: тип с соседом в составе — мимо.
+    #[test]
+    fn подписка_через_определяемый_тип() {
+        let c = индекс_объектов();
+        c.execute_batch(
+            "INSERT INTO defined_types (name, type_refs_json, path) VALUES
+               ('ВерсионируемыеДанные', '[\"Catalog.Номенклатура\", \"Document.РеализацияТоваровУслуг\"]', 'DT/В.xml'),
+               ('ДанныеАгента', '[\"Document.РеализацияТоваровУслугАгента\"]', 'DT/А.xml');
+             INSERT INTO event_subscriptions (name, event, handler_module, handler_procedure, source_types, file) VALUES
+               ('ЗаписатьВерсиюОбъекта', 'OnWrite', 'М', 'П', '[\"DefinedType.ВерсионируемыеДанные\"]', 'ES/1.xml'),
+               ('ПередЗаписьюАгента', 'BeforeWrite', 'М', 'П', '[\"DefinedType.ДанныеАгента\"]', 'ES/2.xml'),
+               ('Напрямую', 'BeforeWrite', 'М', 'П', '[\"DocumentObject.РеализацияТоваровУслуг\"]', 'ES/3.xml'),
+               ('ВсеДокументы', 'FillCheckProcessing', 'М', 'П', '[\"DocumentObject\", \"CatalogObject\"]', 'ES/4.xml'),
+               ('ВсеСправочники', 'FillCheckProcessing', 'М', 'П', '[\"CatalogObject\"]', 'ES/5.xml'),
+               ('ВсеЖурналы', 'BeforeWrite', 'М', 'П', '[\"DocumentJournalObject\"]', 'ES/6.xml');",
+        )
+        .unwrap();
+        let v = object(
+            &c,
+            &json!({"name": "РеализацияТоваровУслуг", "parts": ["subscriptions"]}),
+        )
+        .unwrap();
+        let строки: Vec<(String, Value)> = v["subscriptions"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r[0].as_str().unwrap().to_string(), r[6].clone()))
+            .collect();
+        assert_eq!(
+            строки,
+            [
+                (
+                    "ВсеДокументы".to_string(),
+                    json!("DocumentObject: все объекты вида")
+                ),
+                (
+                    "ЗаписатьВерсиюОбъекта".to_string(),
+                    json!("DefinedType.ВерсионируемыеДанные")
+                ),
+                ("Напрямую".to_string(), Value::Null),
+            ],
+            "{v:#}"
+        );
     }
 
     /// Регистры с общим началом имени — как в типовой УТ.
