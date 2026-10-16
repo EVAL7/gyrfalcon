@@ -1045,6 +1045,154 @@ fn похожие_имена<'a>(
     оценки.into_iter().take(n).map(|(_, к)| к).collect()
 }
 
+/// Вид объекта в полном имени: `Documents` → `Document`.
+///
+/// Основа — `refs::вид_по_категории`, которой пишет сборка; сверху — виды,
+/// что встречаются только в правах (на УТ: параметры сеанса, общие реквизиты,
+/// веб- и HTTP-сервисы, критерии отбора). Одна функция на все разделы
+/// карточки — две копии формулы однажды разойдутся молча.
+fn вид_объекта(категория: &str) -> Option<&'static str> {
+    gyrfalcon_index::refs::вид_по_категории(категория).or(match категория {
+        "SessionParameters" => Some("SessionParameter"),
+        "CommonAttributes" => Some("CommonAttribute"),
+        "WebServices" => Some("WebService"),
+        "HTTPServices" => Some("HTTPService"),
+        "FilterCriteria" => Some("FilterCriterion"),
+        _ => None,
+    })
+}
+
+/// Полное имя относится к объекту: оно само или его элемент (`X.Attribute.Y`).
+fn относится(путь: &str, полное: &str) -> bool {
+    путь == полное
+        || путь
+            .strip_prefix(полное)
+            .is_some_and(|хвост| хвост.starts_with('.'))
+}
+
+/// Права на объект и его элементы; `element` — что именно (у веб-сервиса — операция).
+fn права_объекта(conn: &Connection, полные: &[String]) -> Result<Value, String> {
+    let mut st = conn
+        .prepare(
+            "SELECT role_name, right_name, file, object_name FROM role_rights
+             WHERE object_name = ?1 OR substr(object_name, 1, length(?1) + 1) = ?1 || '.'
+             ORDER BY role_name, right_name, object_name",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut строки = Vec::new();
+    for полное in полные {
+        let найдено = st
+            .query_map([полное], |r| Ok([0, 1, 2, 3].map(|i| значение(r, i))))
+            .map_err(|e| e.to_string())?;
+        for запись in найдено {
+            строки.push(json!(запись.map_err(|e| e.to_string())?));
+        }
+    }
+    Ok(json!({
+        "columns": ["role_name", "right_name", "file", "element"],
+        "count": строки.len(),
+        "rows": строки,
+    }))
+}
+
+/// Функциональные опции, в состав которых входит объект или его элемент.
+///
+/// `content` — JSON-массив полных путей; подстрока в SQL — только отбор
+/// кандидатов, решает точная сверка элементов.
+fn опции_объекта(
+    conn: &Connection,
+    имя: &str,
+    полные: &[String],
+) -> Result<Value, String> {
+    let mut st = conn
+        .prepare(
+            "SELECT name, synonym, location, file, content FROM functional_options
+             WHERE instr(content, ?1) > 0 ORDER BY name",
+        )
+        .map_err(|e| e.to_string())?;
+    let кандидаты = st
+        .query_map([имя], |r| {
+            Ok((
+                [0, 1, 2, 3].map(|i| значение(r, i)),
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut строки = Vec::new();
+    for к in кандидаты {
+        let (поля, состав) = к.map_err(|e| e.to_string())?;
+        let состав: Vec<String> = состав
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let свои: Vec<&String> = состав
+            .iter()
+            .filter(|путь| полные.iter().any(|п| относится(путь, п)))
+            .collect();
+        if !свои.is_empty() {
+            let [имя_опции, синоним, место, файл] = поля;
+            строки.push(json!([имя_опции, синоним, место, файл, свои]));
+        }
+    }
+    Ok(json!({
+        "columns": ["name", "synonym", "location", "file", "elements"],
+        "count": строки.len(),
+        "rows": строки,
+    }))
+}
+
+/// Подписки, у которых объект среди источников.
+///
+/// Источник — тип объекта: вид плюс суффикс (`DocumentObject.X`,
+/// `InformationRegisterRecordSet.X`, `ConstantValueManager.X`). Суффикс
+/// сверяется по закрытому списку: иначе `Document` совпал бы с началом
+/// `DocumentJournal`. Источники через определяемый тип не развёрнуты (п. 7).
+fn подписки_объекта(
+    conn: &Connection,
+    имя: &str,
+    виды: &[&str],
+) -> Result<Value, String> {
+    const СУФФИКСЫ: [&str; 4] = ["Object", "RecordSet", "Manager", "ValueManager"];
+    let mut st = conn
+        .prepare(
+            "SELECT name, event, handler_module, handler_procedure, source_types, file
+             FROM event_subscriptions WHERE instr(source_types, ?1) > 0 ORDER BY name",
+        )
+        .map_err(|e| e.to_string())?;
+    let кандидаты = st
+        .query_map([имя], |r| {
+            Ok((
+                [0, 1, 2, 3, 4, 5].map(|i| значение(r, i)),
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut строки = Vec::new();
+    for к in кандидаты {
+        let (поля, источники) = к.map_err(|e| e.to_string())?;
+        let источники: Vec<String> = источники
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let наш = источники.iter().any(|ист| {
+            ист.split_once('.').is_some_and(|(тип, хвост)| {
+                хвост == имя
+                    && виды.iter().any(|вид| {
+                        тип
+                            .strip_prefix(вид)
+                            .is_some_and(|суф| СУФФИКСЫ.contains(&суф))
+                    })
+            })
+        });
+        if наш {
+            строки.push(json!(поля));
+        }
+    }
+    Ok(json!({
+        "columns": ["name", "event", "handler_module", "handler_procedure", "source_types", "file"],
+        "count": строки.len(),
+        "rows": строки,
+    }))
+}
+
 fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
     let запрошено = строка(args, "name").ok_or("нужен параметр name")?;
     let категория = строка(args, "category");
@@ -1208,40 +1356,31 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
             &[&name],
         )?;
     }
+    // Права, опции и подписки записывают объект ПОЛНЫМ именем (`Document.X`),
+    // реквизиты и движения — коротким. До 0.1.19 все разделы искали по
+    // короткому: права — равенством (и не находили ничего: на УТ в
+    // `role_rights` 0 строк без точки), опции и подписки — подстрокой
+    // (и цепляли `Document.XПрисоединенныеФайлы`, `Document.ЗаказX`).
+    // Теперь полное имя строится одной функцией и сверяется точно.
+    let виды: Vec<&'static str> = категории.iter().filter_map(|к| вид_объекта(к)).collect();
+    let полные: Vec<String> = виды.iter().map(|в| format!("{в}.{name}")).collect();
     if есть("rights") {
-        out["rights"] = выборка(
-            conn,
-            "SELECT role_name, right_name, file FROM role_rights
-             WHERE object_name = ?1 COLLATE NOCASE
-             ORDER BY role_name, right_name",
-            &[&name],
-        )?;
+        out["rights"] = права_объекта(conn, &полные)?;
     }
     if есть("options") {
-        out["options"] = выборка(
-            conn,
-            "SELECT name, synonym, location, file FROM functional_options
-             WHERE content LIKE '%' || ?1 || '%' COLLATE NOCASE
-             ORDER BY name",
-            &[&name],
-        )?;
+        out["options"] = опции_объекта(conn, &name, &полные)?;
     }
     if есть("subscriptions") {
-        out["subscriptions"] = выборка(
-            conn,
-            "SELECT name, event, handler_module, handler_procedure, source_types, file
-             FROM event_subscriptions
-             WHERE source_types LIKE '%' || ?1 || '%' COLLATE NOCASE
-             ORDER BY name",
-            &[&name],
-        )?;
+        out["subscriptions"] = подписки_объекта(conn, &name, &виды)?;
     }
     if есть("scheduled_jobs") {
+        // Обработчик задания — всегда общий модуль, и имя у него точное:
+        // подстрокой `Заказ` цеплялись бы задания модуля `ЗаказыСервер`.
         out["scheduled_jobs"] = выборка(
             conn,
             "SELECT name, method_name, handler_module, handler_procedure, use, file
              FROM scheduled_jobs
-             WHERE handler_module LIKE '%' || ?1 || '%' COLLATE NOCASE
+             WHERE handler_module = ?1
              ORDER BY name",
             &[&name],
         )?;
@@ -2090,6 +2229,67 @@ mod tests {
         assert_eq!(v["categories"], json!(["CommonForms", "CommonModules"]));
     }
 
+    /// Права, опции, подписки и задания — по полному имени и точно (п. 4).
+    ///
+    /// Формы данных сверены на типовой УТ: права и состав опций — полными
+    /// путями, источники подписок — типами `DocumentObject.X`. Соседние имена
+    /// (`…ПрисоединенныеФайлы`, журнал документов) — ровно то, что цеплялось
+    /// подстрокой.
+    #[test]
+    fn разделы_по_полному_имени_без_соседей() {
+        let c = индекс_объектов();
+        c.execute_batch(
+            "INSERT INTO object_synonyms (object_name, category, synonym, file) VALUES
+               ('РеализацияТоваровУслугПрисоединенныеФайлы','Catalogs','','Catalogs/РФ.xml');
+             INSERT INTO role_rights (role_name, object_name, right_name, file) VALUES
+               ('Продажи', 'Document.РеализацияТоваровУслуг', 'Read', 'Roles/П.xml'),
+               ('Продажи', 'Document.РеализацияТоваровУслуг.Command.Печать', 'View', 'Roles/П.xml'),
+               ('Продажи', 'Catalog.РеализацияТоваровУслугПрисоединенныеФайлы', 'Read', 'Roles/П.xml'),
+               ('Продажи', 'Document.РеализацияТоваровУслугАгента', 'Read', 'Roles/П.xml');
+             INSERT INTO functional_options (name, content, file) VALUES
+               ('ИспользоватьАкты', '[\"Document.РеализацияТоваровУслуг.Attribute.Вариант\"]', 'FO/А.xml'),
+               ('ИспользоватьФайлы', '[\"Catalog.РеализацияТоваровУслугПрисоединенныеФайлы\"]', 'FO/Ф.xml');
+             INSERT INTO event_subscriptions (name, event, handler_module, handler_procedure, source_types, file) VALUES
+               ('ПередЗаписьюРеализации', 'BeforeWrite', 'М', 'П', '[\"DocumentObject.РеализацияТоваровУслуг\"]', 'ES/1.xml'),
+               ('ЖурналРеализаций', 'BeforeWrite', 'М', 'П', '[\"DocumentJournalObject.РеализацияТоваровУслуг\"]', 'ES/2.xml'),
+               ('ПередЗаписьюФайлов', 'BeforeWrite', 'М', 'П', '[\"CatalogObject.РеализацияТоваровУслугПрисоединенныеФайлы\"]', 'ES/3.xml');",
+        )
+        .unwrap();
+        let v = object(
+            &c,
+            &json!({"name": "РеализацияТоваровУслуг", "parts": ["rights", "options", "subscriptions"]}),
+        )
+        .unwrap();
+
+        let элементы: Vec<&str> = v["rights"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r[3].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            элементы,
+            [
+                "Document.РеализацияТоваровУслуг",
+                "Document.РеализацияТоваровУслуг.Command.Печать"
+            ],
+            "права — сам объект и его элементы, без соседнего справочника: {v:#}"
+        );
+        assert_eq!(v["options"]["count"], 1, "{v:#}");
+        assert_eq!(v["options"]["rows"][0][0], "ИспользоватьАкты");
+        assert_eq!(
+            v["options"]["rows"][0][4],
+            json!(["Document.РеализацияТоваровУслуг.Attribute.Вариант"]),
+            "в ответе видно, ЧТО из объекта под опцией"
+        );
+        assert_eq!(
+            v["subscriptions"]["count"], 1,
+            "журнал документов и соседний справочник — мимо: {v:#}"
+        );
+        assert_eq!(v["subscriptions"]["rows"][0][0], "ПередЗаписьюРеализации");
+        assert!(v.get("empty_parts").is_none(), "{v:#}");
+    }
+
     /// Регистры с общим началом имени — как в типовой УТ.
     fn индекс_движений() -> Connection {
         let c = Connection::open_in_memory().unwrap();
@@ -2473,20 +2673,20 @@ mod tests {
         c.execute_batch(gyrfalcon_index::ddl::SCHEMA_META2).unwrap();
         c.execute_batch(gyrfalcon_index::ddl::SCHEMA_REFS).unwrap();
         c.execute_batch(
-            "INSERT INTO modules(id, rel_path, object_name, is_form) VALUES
-               (1, 'Documents/Заказ/ObjectModule.bsl', 'Заказ', 0),
-               (2, 'Documents/Заказ/Form.xml', 'Заказ', 1);
+            "INSERT INTO modules(id, rel_path, category, object_name, is_form) VALUES
+               (1, 'Documents/Заказ/ObjectModule.bsl', 'Documents', 'Заказ', 0),
+               (2, 'Documents/Заказ/Form.xml', 'Documents', 'Заказ', 1);
              INSERT INTO methods(id, module_id, name, type, line) VALUES
                (1, 1, 'Провести', 'Procedure', 10),
                (2, 1, 'Запустить', 'Procedure', 20);
              INSERT INTO calls(id, caller_id, callee_name, line, resolution, confidence) VALUES
                (1, 2, 'Провести', 21, 'exact', 1.0);
              INSERT INTO role_rights(role_name, object_name, right_name, file) VALUES
-               ('Менеджер', 'Заказ', 'Read', 'Roles/Менеджер.xml');
+               ('Менеджер', 'Document.Заказ', 'Read', 'Roles/Менеджер.xml');
              INSERT INTO functional_options(name, content, file) VALUES
-               ('ИспользоватьЗаказы', 'Document.Заказ', 'FunctionalOptions/Заказы.xml');
+               ('ИспользоватьЗаказы', '[\"Document.Заказ\"]', 'FunctionalOptions/Заказы.xml');
              INSERT INTO event_subscriptions(name, event, handler_module, handler_procedure, source_types, file) VALUES
-               ('ПередПроведениемЗаказа', 'BeforeWrite', 'Заказ', 'Провести', '[\"Document.Заказ\"]', 'EventSubscriptions/Заказ.xml');
+               ('ПередПроведениемЗаказа', 'BeforeWrite', 'Заказ', 'Провести', '[\"DocumentObject.Заказ\"]', 'EventSubscriptions/Заказ.xml');
              INSERT INTO scheduled_jobs(name, method_name, handler_module, handler_procedure, file) VALUES
                ('НочнойЗаказ', 'Провести', 'Заказ', 'Провести', 'ScheduledJobs/Заказ.xml');
              INSERT INTO metadata_references(source_object, source_category, ref_object, ref_kind, used_in, path) VALUES
