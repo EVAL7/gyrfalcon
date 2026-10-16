@@ -1199,17 +1199,23 @@ fn подписки_объекта(
 
     let mut st = conn
         .prepare(
-            "SELECT name, event, handler_module, handler_procedure, source_types, file
+            "SELECT name, event, handler_module, handler_procedure, file, source_types
              FROM event_subscriptions ORDER BY name",
         )
         .map_err(|e| e.to_string())?;
     // Без отбора в SQL: у подписки на весь вид имени объекта в источниках
     // нет, а подписок в конфигурации сотни (на УТ 300) — перебор дешёвый.
+    //
+    // `source_types` читается для сверки, но в ответ НЕ идёт: это полный
+    // список источников подписки, у `ЗаписатьВерсиюДокумента` — сотни
+    // документов. Замер на УТ: 174 тыс. знаков из 214 тыс. полной карточки
+    // `РеализацияТоваровУслуг` (81%) были этим столбцом. На вопрос «какие
+    // подписки срабатывают на объект» отвечает `via`.
     let кандидаты = st
         .query_map([], |r| {
             Ok((
-                [0, 1, 2, 3, 4, 5].map(|i| значение(r, i)),
-                r.get::<_, Option<String>>(4)?,
+                [0, 1, 2, 3, 4].map(|i| значение(r, i)),
+                r.get::<_, Option<String>>(5)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -1238,9 +1244,12 @@ fn подписки_объекта(
         }
     }
     Ok(json!({
-        "columns": ["name", "event", "handler_module", "handler_procedure", "source_types", "file", "via"],
+        "columns": ["name", "event", "handler_module", "handler_procedure", "file", "via"],
         "count": строки.len(),
         "rows": строки,
+        "note": "via: пусто — объект назван источником прямо; DefinedType.X — через \
+                 определяемый тип; «все объекты вида» — подписка на весь вид. Полный \
+                 список источников подписки — sql по event_subscriptions.source_types",
     }))
 }
 
@@ -2368,7 +2377,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|r| (r[0].as_str().unwrap().to_string(), r[6].clone()))
+            .map(|r| (r[0].as_str().unwrap().to_string(), r[5].clone()))
             .collect();
         assert_eq!(
             строки,
@@ -2383,6 +2392,18 @@ mod tests {
                 ),
                 ("Напрямую".to_string(), Value::Null),
             ],
+            "{v:#}"
+        );
+        // Полный список источников в карточку не идёт: на УТ он был 81% её объёма.
+        assert!(
+            !v["subscriptions"]["columns"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("source_types")),
+            "{v:#}"
+        );
+        assert!(
+            !v["subscriptions"].to_string().contains("CatalogObject"),
             "{v:#}"
         );
     }
