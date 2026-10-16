@@ -56,7 +56,7 @@
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Порог риска по расстоянию — как у образца (`cbm_hop_to_risk`).
@@ -122,6 +122,34 @@ fn git(корень: &PathBuf, аргументы: &[&str]) -> Result<String, St
     Ok(String::from_utf8_lossy(&вывод.stdout).into_owned())
 }
 
+/// Корень репозитория, от которого git отдаёт пути в `diff` и `status`.
+///
+/// Пустой ответ — не репозиторий: отказ, а не «изменений нет».
+fn корень_репозитория(корень: &PathBuf) -> Result<PathBuf, String> {
+    let верх = git(корень, &["rev-parse", "--show-toplevel"])?;
+    let верх = верх.trim();
+    if верх.is_empty() {
+        return Err(format!(
+            "{} не в git-репозитории — карта влияния строится по git",
+            корень.display()
+        ));
+    }
+    let путь = PathBuf::from(верх);
+    Ok(std::fs::canonicalize(&путь).unwrap_or(путь))
+}
+
+/// Путь из git (от корня репозитория, через `/`) → адрес `modules.rel_path`.
+///
+/// Разделители меняются ДО склейки: корень канонизирован, на Windows это
+/// `\\?\C:\…`, а в таком пути `/` разделителем не считается, и `strip_prefix`
+/// в `rel_from` молча не сработал бы.
+fn адрес_в_индексе(src: &Path, верх: &Path, файл: &str) -> String {
+    let файл = файл
+        .trim_start_matches("./")
+        .replace('/', std::path::MAIN_SEPARATOR_STR);
+    gyrfalcon_index::extensions::rel_from(src, &верх.join(файл))
+}
+
 /// Изменённые файлы из трёх источников — объединением, как у образца.
 fn изменённые_файлы(
     корень: &PathBuf, база: &str
@@ -141,13 +169,15 @@ fn изменённые_файлы(
     // 3. неотслеживаемое и добавленное в индекс git — их не видит `diff`
     //    (баг #520 образца: новый файл не появлялся до переиндексации).
     //    Формат строки: два символа кода + пробел + путь («?? a/b.bsl»).
+    //    `all`, а не `normal`: при `normal` новый каталог приходит одной
+    //    строкой `ext/`, а новый общий модуль в 1С — это всегда новый каталог.
     for строка in git(
         корень,
         &[
             "--no-optional-locks",
             "status",
             "--porcelain",
-            "--untracked-files=normal",
+            "--untracked-files=all",
         ],
     )?
     .lines()
@@ -223,32 +253,45 @@ pub fn detect_changes(conn: &Connection, args: &Value) -> Result<Value, String> 
         return Ok(ответ);
     }
 
-    // Файлы diff — пути от корня репозитория, а в индексе `modules.rel_path`
-    // отсчитывается от корня ВЫГРУЗКИ. Он лежит глубже (у ДО это `src/`,
-    // а расширения вовсе в `../ext/`), поэтому сверяем по хвосту пути,
-    // а не по равенству: иначе совпадений не будет ни одного.
+    // Файлы diff — пути от корня РЕПОЗИТОРИЯ, а `modules.rel_path` — от корня
+    // ВЫГРУЗКИ (`src`), у расширения через `../`. Путь приводится к адресу
+    // индекса тем же `rel_from`, что пишет сборка, и сверяется равенством.
+    //
+    // До 0.1.19 сверка шла по хвосту (`?1 LIKE '%' || rel_path`), и врала в
+    // обе стороны: правка своего модуля расширения (`ext/Дор/…` против
+    // `../ext/Дор/…`) не находилась вовсе, а правка заимствованного модуля
+    // совпадала хвостом с одноимённым модулем основной конфигурации и
+    // приписывалась ему. Плюс `_` в именах (`Дор_Сервис`) — подстановочный
+    // знак `LIKE`.
+    let верх = корень_репозитория(&корень)?;
     let mut семена: Vec<(String, String)> = Vec::new(); // (метод, модуль)
+    let mut st = conn
+        .prepare(
+            "SELECT m.name, mo.rel_path FROM methods m
+             JOIN modules mo ON mo.id = m.module_id
+             WHERE mo.rel_path = ?1
+             ORDER BY m.line",
+        )
+        .map_err(|e| e.to_string())?;
     for файл in &файлы {
-        let хвост = файл.trim_start_matches("./");
-        let mut st = conn
-            .prepare(
-                "SELECT m.name, mo.rel_path FROM methods m
-                 JOIN modules mo ON mo.id = m.module_id
-                 WHERE ?1 LIKE '%' || mo.rel_path
-                 ORDER BY m.line",
-            )
-            .map_err(|e| e.to_string())?;
+        let адрес = адрес_в_индексе(&корень, &верх, файл);
         let строки = st
-            .query_map([&хвост], |r| {
+            .query_map([&адрес], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })
             .map_err(|e| e.to_string())?;
-        for пара in строки.flatten() {
-            семена.push(пара);
+        for пара in строки {
+            семена.push(пара.map_err(|e| e.to_string())?);
         }
     }
 
     ответ["changed_methods"] = json!(семена.len());
+    // Сами семена, а не только их число: по числу не отличить «нашёл тот
+    // модуль» от «приписал правку одноимённому чужому».
+    ответ["changed"] = json!({
+        "columns": ["name", "module"],
+        "rows": семена.iter().map(|(n, m)| json!([n, m])).collect::<Vec<_>>(),
+    });
     if семена.is_empty() {
         // Файлы изменены, а методов не нашлось — законный и частый случай в 1С:
         // правка XML метаданных, формы или роли кода не касается вовсе.
@@ -348,21 +391,32 @@ pub fn detect_changes(conn: &Connection, args: &Value) -> Result<Value, String> 
             радиус_с_риском(conn, &sql, &sql_сводка, &параметры, &параметры_сводки)?;
     }
 
-    // Перехваты расширений — наш аналог `has_cross_service` образца.
-    // Считаем по именам семян: если изменённый метод кем-то перехвачен,
-    // в боевой базе исполнится не то, что видно в diff.
-    if let Ok(мера) = conn.query_row(
-        &format!("SELECT COUNT(*) FROM extension_overrides WHERE method_name IN ({список})"),
-        rusqlite::params_from_iter(имена.iter()),
-        |r| r.get::<_, i64>(0),
-    ) {
-        ответ["has_overrides"] = json!(мера > 0);
-        if мера > 0 {
-            ответ["overrides_note"] = json!(
-                "изменённые методы перехвачены расширениями — \
-                 проверьте overrides: исполнится не то, что в diff"
-            );
-        }
+    // Перехваты расширений — наш аналог `has_cross_service` образца: если
+    // изменённый метод кем-то перехвачен, в боевой базе исполнится не то,
+    // что видно в diff. Сверка по паре «метод + модуль-цель»: одноимённый
+    // метод другого модуля перехватом этого не является.
+    //
+    // До 0.1.19 запрос спрашивал несуществующий столбец `method_name`, ошибку
+    // глотал `if let Ok`, и флаг не выставлялся никогда. Поэтому ошибка
+    // здесь — ошибка вызова, а не тихое отсутствие флага.
+    let mut st = conn
+        .prepare(
+            "SELECT COUNT(*) FROM extension_overrides
+             WHERE target_method = ?1 COLLATE NOCASE AND source_path = ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut мера = 0i64;
+    for (метод, модуль) in &семена {
+        мера += st
+            .query_row([метод, модуль], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+    }
+    ответ["has_overrides"] = json!(мера > 0);
+    if мера > 0 {
+        ответ["overrides_note"] = json!(
+            "изменённые методы перехвачены расширениями — \
+             проверьте overrides: исполнится не то, что в diff"
+        );
     }
 
     Ok(ответ)
@@ -452,7 +506,7 @@ mod tests {
              CREATE TABLE modules (id INTEGER PRIMARY KEY, rel_path TEXT);
              CREATE TABLE methods (id INTEGER PRIMARY KEY, name TEXT, module_id INTEGER, line INTEGER);
              CREATE TABLE calls (id INTEGER PRIMARY KEY, caller_id INTEGER, callee_name TEXT);
-             CREATE TABLE extension_overrides (method_name TEXT);",
+             CREATE TABLE extension_overrides (target_method TEXT, source_path TEXT);",
         )
         .unwrap();
         conn
@@ -509,6 +563,184 @@ mod tests {
             r["note"].is_string(),
             "срез списка должен быть назван вслух"
         );
+    }
+
+    /// Репозиторий `<проект>/{src, ext/Дор}` с настоящим git и индексом вне него.
+    ///
+    /// Индекс лежит снаружи, чтобы не попасть в `status` неотслеживаемым.
+    struct Репо {
+        корень: PathBuf,
+        индекс: PathBuf,
+    }
+
+    impl Репо {
+        fn новый(метка: &str) -> Self {
+            let база = std::env::temp_dir().join(format!("gyrfalcon-changes-{метка}"));
+            let _ = std::fs::remove_dir_all(&база);
+            let корень = база.join("repo");
+            let w = |p: &str, t: &str| {
+                let f = корень.join(p);
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(f, t).unwrap();
+            };
+            w(
+                "src/Configuration.xml",
+                "<MetaDataObject><Configuration><Properties><Name>Т</Name>\
+                 </Properties></Configuration></MetaDataObject>",
+            );
+            w(
+                "src/CommonModules/ОбщегоНазначения/Ext/Module.bsl",
+                "Функция ЗначениеРеквизита(С) Экспорт\n\tВозврат С;\nКонецФункции\n",
+            );
+            w(
+                "ext/Дор/Configuration.xml",
+                "<MetaDataObject><Configuration><Properties>\
+                 <ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose>\
+                 </Properties></Configuration></MetaDataObject>",
+            );
+            w(
+                "ext/Дор/CommonModules/Дор_Сервис/Ext/Module.bsl",
+                "Процедура Выполнить() Экспорт\nКонецПроцедуры\n",
+            );
+            w(
+                "ext/Дор/CommonModules/ОбщегоНазначения/Ext/Module.bsl",
+                "&После(\"ЗначениеРеквизита\")\nПроцедура Дор_ЗначениеРеквизита(С)\nКонецПроцедуры\n",
+            );
+            let репо = Self {
+                индекс: база.join("index.db"),
+                корень,
+            };
+            репо.git(&["init", "-q"]);
+            репо.git(&["add", "-A"]);
+            репо.git(&["commit", "-q", "-m", "init"]);
+            gyrfalcon_index::build(&репо.корень.join("src"), &репо.индекс, None).unwrap();
+            репо
+        }
+
+        fn git(&self, a: &[&str]) {
+            let ok = Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "core.autocrlf=false",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .arg("-C")
+                .arg(&self.корень)
+                .args(a)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {a:?}");
+        }
+
+        /// Дописать строку в файл — правка в рабочем дереве.
+        fn тронуть(&self, p: &str) {
+            let f = self.корень.join(p);
+            let mut t = std::fs::read_to_string(&f).unwrap();
+            t.push_str("// правка\n");
+            std::fs::write(f, t).unwrap();
+        }
+
+        fn изменения(&self) -> Value {
+            let conn = Connection::open(&self.индекс).unwrap();
+            detect_changes(&conn, &json!({"since": "HEAD"})).unwrap()
+        }
+    }
+
+    impl Drop for Репо {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.корень.parent().unwrap());
+        }
+    }
+
+    fn семена(v: &Value) -> Vec<(String, String)> {
+        v["changed"]["rows"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|r| (r[0].as_str().unwrap().into(), r[1].as_str().unwrap().into()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Правка собственного модуля расширения видна: diff отдаёт путь от корня
+    /// репозитория (`ext/Дор/…`), индекс — от `src` (`../ext/Дор/…`).
+    #[test]
+    fn правка_своего_модуля_расширения_видна() {
+        let репо = Репо::новый("own");
+        репо.тронуть("ext/Дор/CommonModules/Дор_Сервис/Ext/Module.bsl");
+        let v = репо.изменения();
+        assert_eq!(
+            семена(&v),
+            [(
+                "Выполнить".to_string(),
+                "../ext/Дор/CommonModules/Дор_Сервис/Ext/Module.bsl".to_string()
+            )],
+            "{v:#}"
+        );
+    }
+
+    /// Правка заимствованного модуля в расширении — это правка расширения,
+    /// а не одноимённого модуля основной конфигурации.
+    #[test]
+    fn правка_заимствованного_модуля_не_приписана_основной() {
+        let репо = Репо::новый("adopted");
+        репо.тронуть("ext/Дор/CommonModules/ОбщегоНазначения/Ext/Module.bsl");
+        let v = репо.изменения();
+        assert_eq!(
+            семена(&v),
+            [(
+                "Дор_ЗначениеРеквизита".to_string(),
+                "../ext/Дор/CommonModules/ОбщегоНазначения/Ext/Module.bsl".to_string()
+            )],
+            "{v:#}"
+        );
+    }
+
+    /// Новый модуль в новом каталоге (неотслеживаемый) виден пофайлово.
+    #[test]
+    fn новый_модуль_в_новом_каталоге_виден() {
+        let репо = Репо::новый("untracked");
+        let f = репо
+            .корень
+            .join("ext/Дор/CommonModules/Дор_Новый/Ext/Module.bsl");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, "Процедура Новая() Экспорт\nКонецПроцедуры\n").unwrap();
+        let v = репо.изменения();
+        let файлы: Vec<&str> = v["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            файлы,
+            ["ext/Дор/CommonModules/Дор_Новый/Ext/Module.bsl"],
+            "{v:#}"
+        );
+    }
+
+    /// Правка перехваченного типового метода поднимает `has_overrides`.
+    #[test]
+    fn правка_перехваченного_метода_помечена() {
+        let репо = Репо::новый("overridden");
+        репо.тронуть("src/CommonModules/ОбщегоНазначения/Ext/Module.bsl");
+        let v = репо.изменения();
+        assert_eq!(
+            семена(&v),
+            [(
+                "ЗначениеРеквизита".to_string(),
+                "CommonModules/ОбщегоНазначения/Ext/Module.bsl".to_string()
+            )],
+            "{v:#}"
+        );
+        assert_eq!(v["has_overrides"], true, "{v:#}");
     }
 
     /// Ведущий дефис в ref — внятный отказ, а не `unknown option` от git.
