@@ -433,10 +433,13 @@ fn собрать_таблицы(conn: &Connection) -> Result<ResolveTables> {
     // (Р-022). Обход `HashMap` в произвольном порядке отдал бы имя заимствованного
     // общего модуля то основной конфигурации, то расширению — от запуска к запуску.
     let mut модули: Vec<(String, HashMap<String, MethodRef>)> = по_модулю.into_iter().collect();
-    модули.sort_by_key(|(rel, _)| crate::extensions::расширение_пути(rel).is_some());
+    // Раскладка — по записанному реестру: здесь виден индекс, а не диск, и
+    // имя расширения по одной форме адреса не определить (см. `Раскладка`).
+    let раскладка = crate::extensions::Раскладка::из_индекса(conn)?;
+    модули.sort_by_key(|(rel, _)| rel.starts_with("../"));
     for (rel, методы) in модули {
-        let из_расширения = crate::extensions::расширение_пути(&rel).is_some();
-        let info = crate::classify::classify(crate::extensions::путь_внутри(&rel));
+        let из_расширения = rel.starts_with("../");
+        let info = crate::classify::classify(раскладка.внутри(&rel));
         let занять = |карта: &mut HashMap<String, (String, HashMap<String, MethodRef>)>,
                       имя: &str| {
             let запись = (rel.clone(), методы.clone());
@@ -483,6 +486,12 @@ mod tests {
             let _ = fs::remove_dir_all(&d);
             let общий = d.join("CommonModules/Расчёты/Ext");
             fs::create_dir_all(&общий).unwrap();
+            fs::write(
+                d.join("Configuration.xml"),
+                "<MetaDataObject><Configuration><Properties><Name>Тест</Name>\
+                 </Properties></Configuration></MetaDataObject>",
+            )
+            .unwrap();
             fs::write(
                 общий.join("Module.bsl"),
                 "Функция Посчитать(А) Экспорт\n\tВозврат А;\nКонецФункции\n",

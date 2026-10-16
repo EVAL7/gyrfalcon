@@ -557,7 +557,7 @@ CREATE TABLE IF NOT EXISTS extension_overrides (
 );
 
 -- Реестр расширений: все найденные, с перехватами или без (Р-022).
--- rel_root — адрес корня от source_path: `../ext/<Имя>`. Им же начинаются
+-- rel_root — адрес корня от source_path: `../ext/<Имя>` либо `../cfe` (одно\n-- расширение прямо в каталоге, Р-024). Им же начинаются
 -- адреса всех строк расширения в остальных таблицах.
 CREATE TABLE IF NOT EXISTS extensions (
     name TEXT NOT NULL,

@@ -212,11 +212,19 @@ pub fn parse_event_subscription(path: &Path, rel: &str) -> Option<EventSubscript
         .map(split_handler)
         .unwrap_or((None, None));
 
-    // Источник — один или несколько `<v8:Type>` внутри `<Source>`.
+    // Источник — один или несколько `<v8:Type>` внутри `<Source>`, либо
+    // определяемый тип `<v8:TypeSet>cfg:DefinedType.X`. Второй до 0.1.19
+    // отбрасывался: на типовой УТ так у 121 подписки из 300, и у них
+    // источников не было вовсе. Пишется в исходной форме `DefinedType.X` —
+    // развёртывает её читающий (`defined_types`), а не сборка: состав
+    // определяемого типа хранится без суффикса (`Document.X`), а источники
+    // подписок — с ним (`DocumentObject.X`), и смешивать формы в одном
+    // столбце нельзя (см. `meta::strip_suffix`).
     let source_types: Vec<String> = pairs
         .iter()
         .filter(|(p, _)| {
-            p.iter().any(|t| t == "Source") && p.last().map(String::as_str) == Some("Type")
+            p.iter().any(|t| t == "Source")
+                && matches!(p.last().map(String::as_str), Some("Type" | "TypeSet"))
         })
         .map(|(_, v)| strip_cfg(v).to_string())
         .collect();
@@ -493,6 +501,19 @@ mod tests {
         let p = во_временный("sub-multi.xml", &xml);
         let s = parse_event_subscription(&p, "x.xml").unwrap();
         assert_eq!(s.source_types.len(), 3);
+    }
+
+    /// Источник через определяемый тип — `TypeSet`, а не `Type`; до 0.1.19
+    /// такая подписка оставалась без источников.
+    #[test]
+    fn подписка_с_определяемым_типом_не_теряет_источник() {
+        let xml = ПОДПИСКА.replace(
+            "<Source><v8:Type>cfg:DocumentObject.РасходТовара</v8:Type></Source>",
+            "<Source><v8:TypeSet>cfg:DefinedType.ВерсионируемыеДанные</v8:TypeSet></Source>",
+        );
+        let p = во_временный("sub-typeset.xml", &xml);
+        let s = parse_event_subscription(&p, "x.xml").unwrap();
+        assert_eq!(s.source_types, vec!["DefinedType.ВерсионируемыеДанные"]);
     }
 
     #[test]
