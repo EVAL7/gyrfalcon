@@ -133,7 +133,9 @@ pub const TOOLS: &[Tool] = &[
         name: "object",
         description: "Карточка объекта метаданных: реквизиты с ТИПАМИ и квалификаторами, \
              табличные части, синонимы, предопределённые, формы, движения по регистрам. \
-             Собирается из нескольких таблиц за один вызов — не нужно спрашивать по частям.",
+             Собирается из нескольких таблиц за один вызов — не нужно спрашивать по частям. \
+             Объекта нет — found: false и похожие имена (similar), без пустых разделов; \
+             пустой раздел существующего объекта назван в empty_parts.",
         schema: schema_object,
     },
     Tool {
@@ -145,7 +147,10 @@ pub const TOOLS: &[Tool] = &[
         name: "callers",
         description: "Кто вызывает метод и кого вызывает он — транзитивно, на заданную глубину. \
              У каждого ребра класс разрешения и confidence: «не сумели разрешить» отличимо \
-             от «разрешать нечего». Заменяет поиск по тексту при анализе влияния правки.",
+             от «разрешать нечего». Заменяет поиск по тексту при анализе влияния правки. \
+             Обход — по конкретному методу (module сужает), а не по имени: одноимённые \
+             методы других модулей не подмешиваются; несвязанные вызовы того же имени — \
+             отдельно, в unresolved_same_name. Метода нет — found: false и places.",
         schema: schema_callers,
     },
     Tool {
@@ -341,7 +346,8 @@ fn schema_callers() -> Value {
         json!({
             "method": {"type": "string", "description": "Имя метода"},
             "module": {"type": "string", "description":
-                "Модуль, если метод одноимённый в нескольких (подстрока пути)"},
+                "Модуль, если метод одноимённый в нескольких (подстрока пути). Без него \
+                 вызывающие собираются по каждому одноимённому, столбец via — чей вызов"},
             "direction": {"type": "string", "enum": ["in", "out", "both"], "default": "in",
                 "description": "in — кто вызывает; out — кого вызывает"},
             "depth": {"type": "integer", "default": 2, "description":
@@ -985,8 +991,113 @@ fn find(conn: &Connection, args: &Value) -> Result<Value, String> {
     Ok(out)
 }
 
+/// Объект в реестре индекса: имена и категории всех объектов.
+///
+/// Реестр — `object_synonyms` (каждый объект метаданных, синоним бывает
+/// пустым) плюс владельцы модулей: на типовой УТ четыре общих модуля есть
+/// кодом, а XML описания у них в выгрузке нет. Сверено на `ut-index`:
+/// реквизиты и движения ссылаются только на объекты из этого реестра.
+fn реестр_объектов(conn: &Connection) -> Result<Vec<(String, String)>, String> {
+    let mut st = conn
+        .prepare(
+            "SELECT object_name, category FROM object_synonyms
+             UNION
+             SELECT object_name, COALESCE(category, '') FROM modules
+             WHERE object_name IS NOT NULL AND COALESCE(category, '') <> 'Ext'",
+        )
+        .map_err(|e| e.to_string())?;
+    let строки = st
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|e| e.to_string());
+    строки
+}
+
+/// Ближайшие имена по общим триграммам — для ответа «не найдено».
+///
+/// Триграммы, а не подстрока: `ПоступлениеТоваровУслуг` (в УТ его нет)
+/// подстрокой не находит ничего, а по триграммам приводит к
+/// `ПриобретениеТоваровУслуг` — тому, что спрашивающий, скорее всего, имел в виду.
+fn похожие_имена<'a>(
+    имя: &str,
+    кандидаты: impl Iterator<Item = &'a str>,
+    n: usize,
+) -> Vec<String> {
+    let триграммы = |s: &str| -> std::collections::HashSet<[char; 3]> {
+        let c: Vec<char> = s.to_lowercase().chars().collect();
+        c.windows(3).map(|w| [w[0], w[1], w[2]]).collect()
+    };
+    let искомые = триграммы(имя);
+    if искомые.is_empty() {
+        return Vec::new();
+    }
+    let mut оценки: Vec<(f64, String)> = кандидаты
+        .map(|к| {
+            let свои = триграммы(к);
+            let общих = искомые.intersection(&свои).count() as f64;
+            (общих / искомые.len().max(свои.len()) as f64, к.to_string())
+        })
+        .filter(|(оценка, _)| *оценка >= 0.3)
+        .collect();
+    оценки.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    оценки.dedup_by(|a, b| a.1 == b.1);
+    оценки.into_iter().take(n).map(|(_, к)| к).collect()
+}
+
 fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
-    let name = строка(args, "name").ok_or("нужен параметр name")?;
+    let запрошено = строка(args, "name").ok_or("нужен параметр name")?;
+    let категория = строка(args, "category");
+
+    // Сначала — есть ли объект вообще. До 0.1.19 функция всегда отвечала
+    // карточкой: по `ПоступлениеТоваровУслуг` (в УТ его нет) — пустыми
+    // разделами без единой пометки, и модель подтверждала отсутствие
+    // 14 SQL-запросами за 253 с.
+    //
+    // Сравнение — в Rust: `COLLATE NOCASE` не понижает кириллицу. Найденное
+    // имя в регистре индекса подставляется во все разделы ниже.
+    let реестр = реестр_объектов(conn)?;
+    let ключ = запрошено.to_lowercase();
+    let совпали: Vec<&(String, String)> = реестр
+        .iter()
+        .filter(|(и, _)| и.to_lowercase() == ключ)
+        .collect();
+    let в_категории: Vec<&(String, String)> = совпали
+        .iter()
+        .copied()
+        .filter(|(_, к)| {
+            категория
+                .as_ref()
+                .is_none_or(|кат| к.eq_ignore_ascii_case(кат))
+        })
+        .collect();
+    let Some((name, _)) = в_категории.first().map(|п| (*п).clone()) else {
+        let mut out = json!({"object": запрошено, "found": false});
+        if совпали.is_empty() {
+            let похожие =
+                похожие_имена(&запрошено, реестр.iter().map(|(и, _)| и.as_str()), 5);
+            out["note"] = json!(
+                "объекта с таким именем в индексе нет — ни в одной категории. \
+                 Похожие имена — в similar; поиск по смыслу — find"
+            );
+            out["similar"] = json!(похожие);
+        } else {
+            let mut есть: Vec<&str> = совпали.iter().map(|(_, к)| к.as_str()).collect();
+            есть.sort();
+            есть.dedup();
+            out["note"] = json!(format!(
+                "в категории «{}» объекта нет; это имя есть в: {}",
+                категория.unwrap_or_default(),
+                есть.join(", ")
+            ));
+            out["categories"] = json!(есть);
+        }
+        return Ok(out);
+    };
+    let mut категории: Vec<&str> = в_категории.iter().map(|(_, к)| к.as_str()).collect();
+    категории.sort();
+    категории.dedup();
+
     let parts: Vec<String> = args
         .get("parts")
         .and_then(Value::as_array)
@@ -1014,7 +1125,17 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
         });
     let есть = |p: &str| parts.iter().any(|x| x == p);
 
-    let mut out = json!({"object": name});
+    // Категория из реестра (в его написании), только если её задали.
+    let кат: Option<String> = категория
+        .as_ref()
+        .and(категории.first().map(|к| к.to_string()));
+    let mut out = json!({"object": name, "found": true, "categories": категории});
+    if категории.len() > 1 {
+        out["note"] = json!(
+            "имя есть в нескольких категориях — разделы ниже сведены по всем; \
+             уточните category, если нужна одна"
+        );
+    }
 
     if есть("attributes") {
         // Три сжатия, ни одно не теряет данных (замер 29.08.2026:
@@ -1041,8 +1162,9 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
                     CASE WHEN attr_kind = 'attribute' THEN NULL ELSE attr_kind END AS attr_kind,
                     ts_name, length, precision, scale
              FROM object_attributes WHERE object_name = ?1 COLLATE NOCASE
+               AND (?2 IS NULL OR category = ?2)
              ORDER BY attr_kind, ts_name, attr_name",
-            &[&name],
+            &[&name, &кат],
         )?;
         out["attributes"]["note"] =
             json!("пустой attr_kind = attribute (умолчание); отсутствующий квалификатор = неприменим к типу");
@@ -1051,16 +1173,16 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
         out["synonyms"] = выборка(
             conn,
             "SELECT category, synonym FROM object_synonyms
-             WHERE object_name = ?1 COLLATE NOCASE",
-            &[&name],
+             WHERE object_name = ?1 COLLATE NOCASE AND (?2 IS NULL OR category = ?2)",
+            &[&name, &кат],
         )?;
     }
     if есть("predefined") {
         out["predefined"] = выборка(
             conn,
             "SELECT item_name, item_code, is_folder FROM predefined_items
-             WHERE object_name = ?1 COLLATE NOCASE",
-            &[&name],
+             WHERE object_name = ?1 COLLATE NOCASE AND (?2 IS NULL OR category = ?2)",
+            &[&name, &кат],
         )?;
     }
     if есть("enum_values") {
@@ -1124,39 +1246,134 @@ fn object(conn: &Connection, args: &Value) -> Result<Value, String> {
             &[&name],
         )?;
     }
+    // Пустой раздел существующего объекта — факт о конфигурации, и он
+    // назван, чтобы не путаться с «объекта нет» (тот ответ — выше, без карточки).
+    let пустые: Vec<&str> = parts
+        .iter()
+        .map(String::as_str)
+        .filter(|p| out.get(*p).and_then(|v| v.get("count")) == Some(&json!(0)))
+        .collect();
+    if !пустые.is_empty() {
+        out["empty_parts"] = json!(пустые);
+    }
     Ok(out)
 }
 
+/// Метод в индексе: id, имя, модуль, строка.
+type МетодВИндексе = (i64, String, String, i64);
+
+/// Адрес метода в `calls.callee_key`: `<модуль>::<имя в нижнем регистре>`.
+///
+/// Нижний регистр — Rust, а не SQL: `lower()` SQLite кириллицу не трогает,
+/// а ключ при сборке считался именно Rust.
+fn ключ_метода(модуль: &str, имя: &str) -> String {
+    format!("{модуль}::{}", имя.to_lowercase())
+}
+
+/// Кто вызывает метод и кого вызывает он — по МЕТОДУ, а не по имени.
+///
+/// # Что было не так до 0.1.19
+///
+/// * `module` был объявлен в схеме, но в запрос не попадал.
+/// * Рекурсивный CTE соединял `calls.callee_name` с ИМЕНЕМ, и уже на втором
+///   шаге брались вызывающие любого одноимённого метода. По
+///   `ЗаполнитьПоЗаказуКлиента` с модулем реализации на типовой УТ пришла
+///   сотня чужих `ОбработкаЗаполнения` (41 вызов модели на ответ).
+/// * Ветки «метод не найден» не было: пустой список читался как «никто не
+///   вызывает».
+///
+/// Теперь корни — методы с этим именем, отобранные `module`; обход идёт по
+/// `callee_key` — адресу РАЗРЕШЁННОГО вызова, — а вызовы с тем же именем,
+/// которые индекс не связал ни с каким методом, отданы отдельным разделом и в
+/// рекурсию не идут: они могут быть и нашими, и чужими.
 fn callers(conn: &Connection, args: &Value) -> Result<Value, String> {
     let method = строка(args, "method").ok_or("нужен параметр method")?;
+    let модуль = строка(args, "module");
     let dir = строка(args, "direction").unwrap_or_else(|| "in".into());
     let depth = число(args, "depth").unwrap_or(2).clamp(1, 5);
     let limit = число(args, "limit").unwrap_or(100).clamp(1, 2000) as usize;
 
     let mut out = json!({"method": method, "direction": dir, "depth": depth});
 
-    if dir == "in" || dir == "both" {
-        // Транзитивное замыкание считает SQLite рекурсивным CTE: за один вызов,
-        // а не циклом на стороне агента (Р-101 — ширина вызова вместо песочницы).
-        let v = выборка(
-            conn,
-            "WITH RECURSIVE вверх(name, hop) AS (
-                 SELECT ?1, 0
-                 UNION
-                 SELECT m.name, в.hop + 1
-                 FROM вверх в
-                 JOIN calls c ON c.callee_name = в.name COLLATE NOCASE
-                 JOIN methods m ON m.id = c.caller_id
-                 WHERE в.hop < ?2
-             )
-             SELECT в.name, в.hop, mo.rel_path, m.line
-             FROM вверх в
-             JOIN methods m ON m.name = в.name COLLATE NOCASE
+    let mut st = conn
+        .prepare(
+            "SELECT m.id, m.name, mo.rel_path, m.line FROM methods m
              JOIN modules mo ON mo.id = m.module_id
-             WHERE в.hop > 0 ORDER BY в.hop, в.name LIMIT ?3",
-            &[&method, &depth, &(limit as i64)],
+             WHERE m.name = ?1 COLLATE NOCASE ORDER BY mo.rel_path, m.line",
+        )
+        .map_err(|e| e.to_string())?;
+    let все: Vec<МетодВИндексе> = st
+        .query_map([&method], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|e| e.to_string())?;
+    let фильтр = модуль.as_deref().map(str::to_lowercase);
+    let корни: Vec<&МетодВИндексе> = все
+        .iter()
+        .filter(|m| {
+            фильтр
+                .as_ref()
+                .is_none_or(|f| m.2.to_lowercase().contains(f))
+        })
+        .collect();
+    let места = |ms: &[&МетодВИндексе]| {
+        json!({
+            "columns": ["module", "line"],
+            "rows": ms.iter().map(|m| json!([m.2, m.3])).collect::<Vec<_>>(),
+        })
+    };
+
+    if корни.is_empty() {
+        out["found"] = json!(false);
+        if все.is_empty() {
+            out["note"] = json!(format!(
+                "метод «{method}» не найден в индексе. Имя проверяется через find; \
+                 отсутствие в индексе — не всегда отсутствие в коде (coverage)"
+            ));
+        } else {
+            let есть: Vec<&МетодВИндексе> = все.iter().collect();
+            out["note"] = json!(format!(
+                "в модуле ~ «{}» метода «{method}» нет; метод с этим именем есть в {} — \
+                 повторите с module из places",
+                модуль.unwrap_or_default(),
+                есть.len()
+            ));
+            out["places"] = места(&есть);
+        }
+        return Ok(out);
+    }
+    out["found"] = json!(true);
+    out["targets"] = места(&корни);
+    if корни.len() > 1 {
+        out["note"] = json!(format!(
+            "метод с этим именем есть в {} модулях — вызывающие собраны по каждому \
+             (столбец via — чей вызов); уточните module, если нужен один",
+            корни.len()
+        ));
+    }
+
+    if dir == "in" || dir == "both" {
+        out["callers"] = вызывающие(conn, &корни, depth, limit)?;
+        // Вызовы с тем же именем, не связанные ни с каким методом (объектный
+        // вызов через переменную, менеджер без разрешения): индекс не знает,
+        // чьи они. Показываются, но в рекурсию не идут — иначе вернулась бы
+        // склейка по имени, ради устранения которой это и сделано.
+        out["unresolved_same_name"] = выборка(
+            conn,
+            "SELECT m.name, mo.rel_path, c.line, c.resolution
+             FROM calls c JOIN methods m ON m.id = c.caller_id
+             JOIN modules mo ON mo.id = m.module_id
+             WHERE c.callee_key IS NULL AND c.callee_name = ?1 COLLATE NOCASE
+               AND c.resolution NOT IN ('platform_var', 'platform_global')
+             ORDER BY mo.rel_path, c.line LIMIT ?2",
+            &[&method, &(limit as i64)],
         )?;
-        out["callers"] = v;
+        out["unresolved_same_name"]["note"] = json!(
+            "вызовы этого имени, которые индекс не связал с конкретным методом: \
+             могут быть и вызовами искомого, и чужого; в обход не включены"
+        );
         // Вызовы в модульном коде — не единственная точка входа. Подписки и
         // регламентные задания запускаются платформой, поэтому в таблице calls
         // их принципиально нет; без этого раздела «никто не вызывает» было бы
@@ -1164,16 +1381,87 @@ fn callers(conn: &Connection, args: &Value) -> Result<Value, String> {
         out["platform_entrypoints"] = platform_entrypoints(conn, &method)?;
     }
     if dir == "out" || dir == "both" {
+        let ids: Vec<String> = корни.iter().map(|m| m.0.to_string()).collect();
         let v = выборка(
             conn,
-            "SELECT c.callee_name, c.resolution, c.confidence, c.line
-             FROM calls c JOIN methods m ON m.id = c.caller_id
-             WHERE m.name = ?1 COLLATE NOCASE ORDER BY c.line LIMIT ?2",
-            &[&method, &(limit as i64)],
+            &format!(
+                "SELECT c.callee_name, c.resolution, c.confidence, c.line, mo.rel_path AS via
+                 FROM calls c JOIN methods m ON m.id = c.caller_id
+                 JOIN modules mo ON mo.id = m.module_id
+                 WHERE c.caller_id IN ({}) ORDER BY mo.rel_path, c.line LIMIT ?1",
+                ids.join(",")
+            ),
+            &[&(limit as i64)],
         )?;
         out["callees"] = v;
     }
     Ok(out)
+}
+
+/// Транзитивные вызывающие корней — обход в ширину по `callee_key`.
+///
+/// В Rust, а не рекурсивным CTE: ключ вызывающего строится из его модуля и
+/// имени в нижнем регистре, а `lower()` SQLite кириллицу не понижает.
+/// Каждый шаг — запрос по индексу `idx_calls_callee_key`.
+fn вызывающие(
+    conn: &Connection,
+    корни: &[&МетодВИндексе],
+    depth: i64,
+    limit: usize,
+) -> Result<Value, String> {
+    let mut st = conn
+        .prepare(
+            "SELECT DISTINCT m.id, m.name, mo.rel_path, m.line
+             FROM calls c JOIN methods m ON m.id = c.caller_id
+             JOIN modules mo ON mo.id = m.module_id
+             WHERE c.callee_key = ?1 ORDER BY mo.rel_path, m.line",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut виденные: std::collections::HashSet<i64> = корни.iter().map(|m| m.0).collect();
+    // (ключ вызываемого, модуль корня, от которого пришли)
+    let mut фронт: Vec<(String, String)> = корни
+        .iter()
+        .map(|m| (ключ_метода(&m.2, &m.1), m.2.clone()))
+        .collect();
+    let mut строки = Vec::new();
+    let mut обрезано = false;
+    'обход: for hop in 1..=depth {
+        let mut следующий = Vec::new();
+        for (ключ, via) in &фронт {
+            let найдено: Vec<МетодВИндексе> = st
+                .query_map([ключ], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<rusqlite::Result<_>>()
+                .map_err(|e| e.to_string())?;
+            for (id, имя, модуль, строка) in найдено {
+                if !виденные.insert(id) {
+                    continue;
+                }
+                if строки.len() >= limit {
+                    обрезано = true;
+                    break 'обход;
+                }
+                следующий.push((ключ_метода(&модуль, &имя), via.clone()));
+                строки.push(json!([имя, hop, модуль, строка, via]));
+            }
+        }
+        if следующий.is_empty() {
+            break;
+        }
+        фронт = следующий;
+    }
+    let mut v = json!({
+        "columns": ["name", "hop", "rel_path", "line", "via"],
+        "count": строки.len(),
+        "rows": строки,
+    });
+    if обрезано {
+        v["truncated"] = json!(true);
+        v["note"] = json!("достигнут limit — показаны ближайшие по расстоянию");
+    }
+    Ok(v)
 }
 
 fn platform_entrypoints(conn: &Connection, method: &str) -> Result<Value, String> {
@@ -1596,6 +1884,211 @@ fn coverage(conn: &Connection) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Два документа с одноимёнными методами — как `ОбработкаЗаполнения` и
+    /// `ЗаполнитьПоЗаказуКлиента` в десятке документов типовой УТ.
+    ///
+    /// Индекс собирается настоящей сборкой: `callee_key` пишет только она,
+    /// а тест на выдуманной схеме проверял бы запрос против самого себя.
+    struct ИндексВызовов(std::path::PathBuf);
+
+    impl ИндексВызовов {
+        fn новый(метка: &str) -> Self {
+            let d = std::env::temp_dir().join(format!("gyrfalcon-callers-{метка}"));
+            let _ = std::fs::remove_dir_all(&d);
+            let w = |p: &str, t: &str| {
+                let f = d.join("src").join(p);
+                std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+                std::fs::write(f, t).unwrap();
+            };
+            w(
+                "Configuration.xml",
+                "<MetaDataObject><Configuration><Properties><Name>Т</Name>\
+                 </Properties></Configuration></MetaDataObject>",
+            );
+            for (док, верх) in [("А", "Верх"), ("Б", "ЧужойВерх")] {
+                w(
+                    &format!("Documents/{док}/Ext/ObjectModule.bsl"),
+                    &format!(
+                        "Процедура {верх}()\n\tОбработкаЗаполнения();\nКонецПроцедуры\n\
+                         Процедура ОбработкаЗаполнения()\n\tЗаполнитьПоЗаказуКлиента();\nКонецПроцедуры\n\
+                         Процедура ЗаполнитьПоЗаказуКлиента()\nКонецПроцедуры\n"
+                    ),
+                );
+            }
+            gyrfalcon_index::build(&d.join("src"), &d.join("i.db"), None).unwrap();
+            Self(d)
+        }
+        fn вызвать(&self, a: Value) -> Value {
+            let c = Connection::open(self.0.join("i.db")).unwrap();
+            callers(&c, &a).unwrap()
+        }
+    }
+
+    impl Drop for ИндексВызовов {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn имена_вызывающих(v: &Value) -> Vec<(String, i64, String)> {
+        v["callers"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r[0].as_str().unwrap().to_string(),
+                    r[1].as_i64().unwrap(),
+                    r[2].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// `module` учитывается, а второй шаг идёт по методу, а не по имени:
+    /// вызывающие одноимённой `ОбработкаЗаполнения` документа Б не попадают.
+    #[test]
+    fn callers_по_методу_модуля_а_не_по_имени() {
+        let и = ИндексВызовов::новый("by-method");
+        let v = и.вызвать(
+            json!({"method": "ЗаполнитьПоЗаказуКлиента", "module": "Documents/А/"}),
+        );
+        let путь_а = "Documents/А/Ext/ObjectModule.bsl".to_string();
+        assert_eq!(
+            имена_вызывающих(&v),
+            [
+                ("ОбработкаЗаполнения".to_string(), 1, путь_а.clone()),
+                ("Верх".to_string(), 2, путь_а)
+            ],
+            "{v:#}"
+        );
+        assert_eq!(v["found"], true);
+    }
+
+    /// Без `module` — по каждому из одноимённых, с пометкой и столбцом `via`.
+    #[test]
+    fn callers_без_модуля_по_каждому_одноимённому() {
+        let и = ИндексВызовов::новый("all-targets");
+        let v = и.вызвать(json!({"method": "ЗаполнитьПоЗаказуКлиента"}));
+        assert_eq!(v["targets"]["rows"].as_array().unwrap().len(), 2, "{v:#}");
+        assert!(v["note"].as_str().unwrap().contains("module"), "{v:#}");
+        let мимо: Vec<_> = имена_вызывающих(&v)
+            .into_iter()
+            .filter(|(имя, hop, _)| имя == "ОбработкаЗаполнения" && *hop != 1)
+            .collect();
+        assert!(
+            мимо.is_empty(),
+            "одноимённый не должен уйти на второй шаг: {v:#}"
+        );
+        assert_eq!(имена_вызывающих(&v).len(), 4, "по два на документ: {v:#}");
+    }
+
+    /// Метода нет в указанном модуле — «не найдено» и места, где он есть.
+    #[test]
+    fn callers_не_найдено_с_местами() {
+        let и = ИндексВызовов::новый("not-found");
+        let v = и.вызвать(
+            json!({"method": "ЗаполнитьПоЗаказуКлиента", "module": "CommonModules/"}),
+        );
+        assert_eq!(v["found"], false, "{v:#}");
+        assert_eq!(v["places"]["rows"].as_array().unwrap().len(), 2, "{v:#}");
+        assert!(
+            v.get("callers").is_none(),
+            "пустого списка вызывающих быть не должно"
+        );
+
+        let v = и.вызвать(json!({"method": "НетТакогоМетода"}));
+        assert_eq!(v["found"], false, "{v:#}");
+        assert!(v["note"].as_str().unwrap().contains("find"), "{v:#}");
+    }
+
+    /// Реестр объектов типовой УТ в миниатюре.
+    fn индекс_объектов() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA).unwrap();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA_META).unwrap();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA_META2).unwrap();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA_INTEGRATION)
+            .unwrap();
+        c.execute_batch(
+            "INSERT INTO object_synonyms (object_name, category, synonym, file) VALUES
+               ('РеализацияТоваровУслуг','Documents','Реализация','Documents/Р.xml'),
+               ('ПриобретениеТоваровУслуг','Documents','Приобретение','Documents/П.xml'),
+               ('АвтономнаяРабота','CommonModules','','CommonModules/А.xml'),
+               ('АвтономнаяРабота','CommonForms','','CommonForms/А.xml');
+             INSERT INTO object_attributes (object_name, category, attr_name, attr_type, attr_kind, source_file)
+               VALUES ('РеализацияТоваровУслуг','Documents','Контрагент','CatalogRef.Контрагенты','attribute','Documents/Р.xml');",
+        )
+        .unwrap();
+        c
+    }
+
+    /// Объекта нет — `found: false` и ближайшие имена, а не карточка из пустот.
+    #[test]
+    fn object_не_найден_с_похожими() {
+        let c = индекс_объектов();
+        let v = object(&c, &json!({"name": "ПоступлениеТоваровУслуг"})).unwrap();
+        assert_eq!(v["found"], false, "{v:#}");
+        assert!(
+            v.get("attributes").is_none(),
+            "разделов у несуществующего нет: {v:#}"
+        );
+        assert_eq!(v["similar"][0], "ПриобретениеТоваровУслуг", "{v:#}");
+    }
+
+    /// Существующий объект: пустые разделы названы, регистр кириллицы не важен,
+    /// имя в ответе — в написании индекса.
+    #[test]
+    fn object_существует_пустые_разделы_названы() {
+        let c = индекс_объектов();
+        let v = object(
+            &c,
+            &json!({"name": "реализациятоваровуслуг", "parts": ["attributes", "movements"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            (v["found"].clone(), v["object"].clone()),
+            (json!(true), json!("РеализацияТоваровУслуг"))
+        );
+        assert_eq!(v["attributes"]["count"], 1, "{v:#}");
+        assert_eq!(v["empty_parts"], json!(["movements"]), "{v:#}");
+    }
+
+    /// `category` работает: не та категория — «не найдено» с перечнем, где имя есть.
+    #[test]
+    fn object_категория_учитывается() {
+        let c = индекс_объектов();
+        let v = object(
+            &c,
+            &json!({"name": "АвтономнаяРабота", "parts": ["synonyms"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            v["categories"],
+            json!(["CommonForms", "CommonModules"]),
+            "{v:#}"
+        );
+        assert_eq!(v["synonyms"]["count"], 2);
+
+        let v = object(
+            &c,
+            &json!({"name": "АвтономнаяРабота", "category": "CommonModules", "parts": ["synonyms"]}),
+        )
+        .unwrap();
+        assert_eq!(
+            v["synonyms"]["count"], 1,
+            "разделы сужены категорией: {v:#}"
+        );
+
+        let v = object(
+            &c,
+            &json!({"name": "АвтономнаяРабота", "category": "Documents"}),
+        )
+        .unwrap();
+        assert_eq!(v["found"], false, "{v:#}");
+        assert_eq!(v["categories"], json!(["CommonForms", "CommonModules"]));
+    }
 
     /// Регистры с общим началом имени — как в типовой УТ.
     fn индекс_движений() -> Connection {
