@@ -24,6 +24,13 @@ pub enum IndexError {
     NotImplemented(&'static str),
     #[error("модулей .bsl не найдено: {0}")]
     NoModules(String),
+    /// В корне нет `Configuration.xml` — это не выгрузка конфигурации
+    /// (не тот каталог, недовыгрузка). Отказ, а не индекс из нулей.
+    #[error(
+        "в корне нет Configuration.xml: {0} — это не выгрузка конфигурации в файлы; \
+         укажите каталог, где лежит Configuration.xml основной конфигурации"
+    )]
+    NoConfiguration(String),
     #[error("ошибка ввода-вывода: {0}")]
     Io(#[from] std::io::Error),
     #[error("ошибка SQLite: {0}")]

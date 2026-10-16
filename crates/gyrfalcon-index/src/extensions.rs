@@ -7,10 +7,21 @@
 //!
 //! # Где лежат расширения
 //!
-//! Не внутри `src`, а СОСЕДЯМИ от него: `<проект>/ext/<Имя расширения>/…`
-//! (у части конфигураций каталог зовётся `cfe`). Внутри — обычная выгрузка
-//! со своим `Configuration.xml`, поэтому разбор модуля тот же, что у основной
-//! конфигурации; отличается только связывание с целью.
+//! Не внутри `src`, а СОСЕДЯМИ от него, и в двух раскладках:
+//!
+//! * контейнер — `<проект>/ext/<Имя расширения>/Configuration.xml`, по
+//!   подкаталогу на расширение;
+//! * одно расширение — `<проект>/cfe/Configuration.xml`: каталог сам и есть
+//!   выгрузка расширения. Имя тогда берётся из манифеста, а не из каталога —
+//!   иначе расширение звалось бы `cfe`.
+//!
+//! Каталог зовётся `ext` или `cfe` — в обеих раскладках. Внутри — обычная
+//! выгрузка со своим `Configuration.xml`, поэтому разбор модуля тот же, что у
+//! основной конфигурации; отличается только связывание с целью.
+//!
+//! До 0.1.19 вторая раскладка не была видна вовсе: искался только контейнер,
+//! и проект с одним расширением собирался с `extensions = 0` без единого
+//! предупреждения.
 //!
 //! # Два адреса, и они про разное
 //!
@@ -94,8 +105,24 @@ pub fn extension_dirs(src: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Расширения внутри каталога-контейнера: по одному подкаталогу на расширение.
+/// Каталог сам является выгрузкой расширения, а не контейнером.
+fn одно_расширение(dir: &Path) -> bool {
+    dir.join("Configuration.xml").is_file()
+}
+
+/// Расширения в каталоге `ext`/`cfe`: сам каталог, если в нём лежит
+/// `Configuration.xml`, иначе — по одному подкаталогу на расширение.
 pub fn collect_extensions(dir: &Path) -> Vec<Extension> {
+    if одно_расширение(dir) {
+        let m = parse_manifest(&dir.join("Configuration.xml"));
+        let name = m.name.unwrap_or_else(|| имя_каталога(dir));
+        return vec![Extension {
+            name,
+            purpose: m.purpose,
+            name_prefix: m.prefix,
+            root: dir.to_path_buf(),
+        }];
+    }
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -109,21 +136,26 @@ pub fn collect_extensions(dir: &Path) -> Vec<Extension> {
         if !manifest.is_file() {
             continue;
         }
-        let name = root
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default()
-            .to_string();
-        let (purpose, name_prefix) = parse_manifest(&manifest);
+        // Имя — по каталогу, как до 0.1.19: на нём держатся адреса уже
+        // собранных индексов, а в выгрузке каталог и так назван по расширению.
+        let name = имя_каталога(&root);
+        let m = parse_manifest(&manifest);
         out.push(Extension {
             name,
-            purpose,
-            name_prefix,
+            purpose: m.purpose,
+            name_prefix: m.prefix,
             root,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+fn имя_каталога(dir: &Path) -> String {
+    dir.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Корень разбора: основная конфигурация или одно расширение.
@@ -184,7 +216,8 @@ pub fn rel_from(src: &Path, path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-/// Корень, внутри которого лежит файл: `src` либо `<родитель>/ext|cfe/<Имя>`.
+/// Корень, внутри которого лежит файл: `src`, `<родитель>/ext|cfe/<Имя>`
+/// либо сам `<родитель>/cfe`, когда это одно расширение.
 ///
 /// Нужен там, где файл приходит по одному (инкремент, сторож свежести):
 /// классификация модуля идёт по пути ВНУТРИ его выгрузки, а не от `src`.
@@ -194,6 +227,9 @@ pub fn корень_файла(src: &Path, path: &Path) -> Option<PathBuf> {
     }
     for d in extension_dirs(src) {
         if let Ok(r) = path.strip_prefix(&d) {
+            if одно_расширение(&d) {
+                return Some(d);
+            }
             let имя = r.components().next()?;
             return Some(d.join(имя.as_os_str()));
         }
@@ -201,65 +237,119 @@ pub fn корень_файла(src: &Path, path: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Имя расширения по адресу файла: `../ext/<Имя>/…` → `<Имя>`.
-pub fn расширение_пути(rel: &str) -> Option<&str> {
-    let хвост = rel.strip_prefix("../")?;
-    let mut it = хвост.splitn(3, '/');
-    let _контейнер = it.next()?;
-    it.next()
+/// Где в адресах лежит каждое расширение: `rel_root` → имя.
+///
+/// # Зачем отдельная структура, а не разбор адреса
+///
+/// До 0.1.19 имя расширения вынималось из адреса строкой: `../ext/<Имя>/…`,
+/// третий сегмент. У одного расширения в `cfe/` адрес `../cfe/CommonModules/…`,
+/// и тот же разбор назвал бы расширением `CommonModules`. Форма адреса сама по
+/// себе раскладку не выдаёт — её знает только тот, кто видел диск (сборка) или
+/// записанный реестр `extensions` (инкремент). Отсюда два конструктора.
+#[derive(Debug, Clone, Default)]
+pub struct Раскладка {
+    /// `(rel_root, имя)`; `rel_root` — без завершающего `/`.
+    корни: Vec<(String, String)>,
 }
 
-/// Путь внутри выгрузки, которой принадлежит файл: `../ext/<Имя>/X/Y` → `X/Y`.
-/// Путь основной конфигурации возвращается как есть.
-pub fn путь_внутри(rel: &str) -> &str {
-    match rel.strip_prefix("../") {
-        Some(хвост) => хвост.splitn(3, '/').nth(2).unwrap_or(rel),
-        None => rel,
+impl Раскладка {
+    /// По корням, найденным на диске.
+    pub fn из_корней(src: &Path, корни: &[Корень]) -> Self {
+        Self {
+            корни: корни
+                .iter()
+                .filter_map(|к| {
+                    let e = к.extension.as_ref()?;
+                    Some((rel_from(src, &к.dir), e.name.clone()))
+                })
+                .collect(),
+        }
+    }
+
+    /// По записанному реестру `extensions` — для инкремента, где диска
+    /// целиком не видно.
+    pub fn из_индекса(conn: &rusqlite::Connection) -> rusqlite::Result<Self> {
+        let mut st = conn.prepare("SELECT rel_root, name FROM extensions")?;
+        let корни = st
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(Self { корни })
+    }
+
+    fn найти<'a>(&self, rel: &'a str) -> Option<(&str, &'a str)> {
+        self.корни.iter().find_map(|(корень, имя)| {
+            let хвост = rel.strip_prefix(корень.as_str())?.strip_prefix('/')?;
+            Some((имя.as_str(), хвост))
+        })
+    }
+
+    /// Имя расширения, которому принадлежит адрес; `None` — основная конфигурация.
+    pub fn расширение(&self, rel: &str) -> Option<&str> {
+        self.найти(rel).map(|(имя, _)| имя)
+    }
+
+    /// Путь внутри выгрузки, которой принадлежит файл: `../ext/<Имя>/X/Y` → `X/Y`,
+    /// `../cfe/X/Y` → `X/Y`. Путь основной конфигурации возвращается как есть.
+    pub fn внутри<'a>(&self, rel: &'a str) -> &'a str {
+        self.найти(rel).map_or(rel, |(_, хвост)| хвост)
     }
 }
 
-/// Назначение и префикс из манифеста расширения.
-fn parse_manifest(path: &Path) -> (Option<String>, Option<String>) {
+/// Что берётся из манифеста расширения.
+#[derive(Debug, Default)]
+struct Манифест {
+    name: Option<String>,
+    purpose: Option<String>,
+    prefix: Option<String>,
+}
+
+/// Имя, назначение и префикс из манифеста расширения.
+///
+/// Имя — только `Properties/Name` верхнего уровня: `Name` встречается и глубже
+/// (в описаниях языков), и первое попавшееся было бы не тем.
+fn parse_manifest(path: &Path) -> Манифест {
+    let mut out = Манифест::default();
     let Ok(text) = std::fs::read_to_string(path) else {
-        return (None, None);
+        return out;
     };
     let mut reader = Reader::from_str(&text);
     reader.config_mut().trim_text(true);
 
-    let mut purpose = None;
-    let mut prefix = None;
-    let mut current: Option<&'static str> = None;
+    let mut стек: Vec<Vec<u8>> = Vec::new();
     let mut buf = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(e)) => {
-                current = match local_name(e.name().as_ref()) {
-                    b"ConfigurationExtensionPurpose" => Some("purpose"),
-                    b"NamePrefix" => Some("prefix"),
+            Ok(Event::Start(e)) => стек.push(local_name(e.name().as_ref()).to_vec()),
+            Ok(Event::Text(t)) => {
+                let Some(тег) = стек.last() else {
+                    buf.clear();
+                    continue;
+                };
+                // MetaDataObject / Configuration / Properties / <поле>
+                let в_свойствах = стек.len() == 4 && стек[2].as_slice() == b"Properties";
+                let поле = match тег.as_slice() {
+                    b"ConfigurationExtensionPurpose" => Some(&mut out.purpose),
+                    b"NamePrefix" => Some(&mut out.prefix),
+                    b"Name" if в_свойствах => Some(&mut out.name),
                     _ => None,
                 };
-            }
-            Ok(Event::Text(t)) => {
-                if let Some(field) = current {
-                    if let Ok(v) = t.unescape() {
-                        let v = v.trim().to_string();
-                        if !v.is_empty() {
-                            match field {
-                                "purpose" => purpose = Some(v),
-                                _ => prefix = Some(v),
-                            }
-                        }
+                if let (Some(поле), Ok(v)) = (поле, t.unescape()) {
+                    let v = v.trim();
+                    if !v.is_empty() && поле.is_none() {
+                        *поле = Some(v.to_string());
                     }
                 }
             }
-            Ok(Event::End(_)) => current = None,
+            Ok(Event::End(_)) => {
+                стек.pop();
+            }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
         buf.clear();
     }
-    (purpose, prefix)
+    out
 }
 
 /// Локальное имя тега без префикса пространства имён.
@@ -299,9 +389,87 @@ mod тесты_адреса {
             Path::new("C:/p/ext/Доработка/CommonModules/Б/Ext/Module.bsl"),
         );
         assert_eq!(r, "../ext/Доработка/CommonModules/Б/Ext/Module.bsl");
-        assert_eq!(расширение_пути(&r), Some("Доработка"));
-        assert_eq!(путь_внутри(&r), "CommonModules/Б/Ext/Module.bsl");
-        assert_eq!(расширение_пути("CommonModules/А/Ext/Module.bsl"), None);
-        assert_eq!(путь_внутри("CommonModules/А"), "CommonModules/А");
+    }
+
+    /// Обе раскладки на диске: контейнер `ext/<Имя>` и одно расширение `cfe/`.
+    fn проект(метка: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("gyrfalcon-ext-layout-{метка}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        d
+    }
+
+    fn манифест(dir: &Path, имя: Option<&str>) {
+        std::fs::create_dir_all(dir).unwrap();
+        let имя = имя.map(|и| format!("<Name>{и}</Name>")).unwrap_or_default();
+        std::fs::write(
+            dir.join("Configuration.xml"),
+            format!(
+                "<MetaDataObject xmlns=\"http://v8.1c.ru/8.3/MDClasses\"><Configuration>\
+                 <InternalInfo><Name>ЛожноеИмя</Name></InternalInfo>\
+                 <Properties>{имя}<ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose>\
+                 <NamePrefix>Св_</NamePrefix><Synonym><v8:item><v8:lang>ru</v8:lang>\
+                 <v8:content>Не имя</v8:content></v8:item></Synonym></Properties>\
+                 </Configuration></MetaDataObject>"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn одно_расширение_в_cfe_видно_под_именем_из_манифеста() {
+        let d = проект("single");
+        манифест(&d.join("cfe"), Some("СвоёРасширение"));
+        let src = d.join("src");
+
+        let к = корни(&src);
+        assert_eq!(к.len(), 2, "основная + одно расширение");
+        let e = к[1].extension.as_ref().unwrap();
+        assert_eq!(e.name, "СвоёРасширение", "имя из манифеста, а не `cfe`");
+        assert_eq!(e.purpose.as_deref(), Some("Customization"));
+        assert_eq!(e.name_prefix.as_deref(), Some("Св_"));
+        assert_eq!(к[1].dir, d.join("cfe"));
+
+        let файл = d.join("cfe/CommonModules/Св_Сервис/Ext/Module.bsl");
+        assert_eq!(корень_файла(&src, &файл), Some(d.join("cfe")));
+
+        let раскл = Раскладка::из_корней(&src, &к);
+        let rel = rel_from(&src, &файл);
+        assert_eq!(rel, "../cfe/CommonModules/Св_Сервис/Ext/Module.bsl");
+        assert_eq!(раскл.расширение(&rel), Some("СвоёРасширение"));
+        assert_eq!(раскл.внутри(&rel), "CommonModules/Св_Сервис/Ext/Module.bsl");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn контейнер_ext_прежний() {
+        let d = проект("container");
+        манифест(&d.join("ext/Доработка"), Some("ИмяИзМанифеста"));
+        манифест(&d.join("ext/Второе"), None);
+        let src = d.join("src");
+
+        let к = корни(&src);
+        let имена: Vec<&str> = к
+            .iter()
+            .filter_map(|к| к.extension.as_ref().map(|e| e.name.as_str()))
+            .collect();
+        assert_eq!(
+            имена,
+            ["Второе", "Доработка"],
+            "в контейнере имя — по каталогу"
+        );
+
+        let файл = d.join("ext/Доработка/Catalogs/Товар.xml");
+        assert_eq!(корень_файла(&src, &файл), Some(d.join("ext/Доработка")));
+        let раскл = Раскладка::из_корней(&src, &к);
+        let rel = rel_from(&src, &файл);
+        assert_eq!(раскл.расширение(&rel), Some("Доработка"));
+        assert_eq!(раскл.внутри(&rel), "Catalogs/Товар.xml");
+        assert_eq!(раскл.расширение("CommonModules/А/Ext/Module.bsl"), None);
+        assert_eq!(раскл.внутри("CommonModules/А"), "CommonModules/А");
+        // Префикс без разделителя — не принадлежность: `../ext/Доработка2`
+        // не лежит в `../ext/Доработка`.
+        assert_eq!(раскл.расширение("../ext/Доработка2/X.xml"), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

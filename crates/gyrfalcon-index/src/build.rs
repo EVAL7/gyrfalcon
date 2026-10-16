@@ -149,6 +149,11 @@ pub fn build(src: &Path, out: &Path, dict: Option<&Path>) -> Result<BuildReport>
     // Корни — основная конфигурация и каждое расширение (Р-022). Основная
     // идёт первой: при совпадении имён адресатом вызова остаётся её объект.
     let t = Instant::now();
+    // Без манифеста у корня это не выгрузка: не тот каталог или недовыгрузка.
+    // Собранный по нему индекс отвечал бы нулями, неотличимыми от «нет такого».
+    if !src.join("Configuration.xml").is_file() {
+        return Err(IndexError::NoConfiguration(src.display().to_string()));
+    }
     let корни = extensions::корни(src);
     let mut paths = gyrfalcon_parser::scan::collect_modules(src);
     if paths.is_empty() {
@@ -457,7 +462,7 @@ fn write_modules(
             // конфигурации, а в расширении только его перехватчики. Основная
             // записана раньше (порядок корней), поэтому «свободно» и значит
             // «собственный объект расширения».
-            let из_расширения = extensions::расширение_пути(&m.rel_path).is_some();
+            let из_расширения = из_расширения(&m.rel_path);
             if classify::is_common_module(&m.info) {
                 if let Some(name) = &m.info.object_name {
                     let запись = (m.rel_path.clone(), own.clone());
@@ -657,13 +662,14 @@ fn write_metadata(
              VALUES (?1,?2,?3,?4,?5)",
         )?;
 
+        let раскладка = extensions::Раскладка::из_корней(src, корни);
         let mut объектов: u64 = 0;
         for (obj, pre) in &parsed {
             // Заимствованный объект — не новый объект: его синоним, состав
             // перечисления и предопределённые уже записаны из основной
             // конфигурации. От него в индекс идёт только добавленное.
             let заимствован = из_расширения(&obj.source_file) && obj.adopted;
-            if let Some(расширение) = extensions::расширение_пути(&obj.source_file)
+            if let Some(расширение) = раскладка.расширение(&obj.source_file)
             {
                 ins_eo.execute(rusqlite::params![
                     расширение,
@@ -2143,7 +2149,19 @@ fn скопировать_словарь(conn: &Connection, dict: &Path) -> Resu
 mod tests {
     use super::*;
 
+    /// Манифест основной конфигурации — без него сборка отказывает.
+    pub(crate) fn манифест_основной(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("Configuration.xml"),
+            "<MetaDataObject xmlns=\"http://v8.1c.ru/8.3/MDClasses\"><Configuration>\
+             <Properties><Name>Тест</Name></Properties></Configuration></MetaDataObject>",
+        )
+        .unwrap();
+    }
+
     fn корпус(dir: &Path) {
+        манифест_основной(dir);
         let common = dir.join("CommonModules/ОбщегоНазначения/Ext");
         std::fs::create_dir_all(&common).unwrap();
         std::fs::write(
@@ -2396,9 +2414,97 @@ mod tests {
         // Правило заглушек: пустой результат неотличим от «нечего индексировать».
         let dir = std::env::temp_dir().join("gyrfalcon-build-empty");
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        манифест_основной(&dir);
         let e = build(&dir, &dir.join("i.db"), None);
         assert!(matches!(e, Err(IndexError::NoModules(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn каталог_без_манифеста_даёт_отказ_даже_с_модулями() {
+        // Не тот каталог (родитель выгрузки, недовыгрузка) — отказ сразу:
+        // индекс из нулей неотличим от ответа «такого нет».
+        let dir = std::env::temp_dir().join("gyrfalcon-build-nomanifest");
+        let _ = std::fs::remove_dir_all(&dir);
+        корпус(&dir);
+        std::fs::remove_file(dir.join("Configuration.xml")).unwrap();
+        let e = build(&dir, &dir.join("i.db"), None);
+        assert!(matches!(e, Err(IndexError::NoConfiguration(_))), "{e:?}");
+        assert!(!dir.join("i.db").exists(), "индекс не создан");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Проект с ОДНИМ расширением в `cfe/`: каталог сам и есть его выгрузка.
+    #[test]
+    fn одно_расширение_в_cfe_индексируется() {
+        let dir = std::env::temp_dir().join("gyrfalcon-build-cfe-single");
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = dir.join("src");
+        корпус(&src);
+        записать(
+            &src.join("Catalogs/Товар.xml"),
+            &справочник("Товар", false, &[], &["Артикул"]),
+        );
+        let ext = dir.join("cfe");
+        записать(
+            &ext.join("Configuration.xml"),
+            "<MetaDataObject xmlns=\"http://v8.1c.ru/8.3/MDClasses\"><Configuration>\
+             <Properties><Name>СвоёРасширение</Name>\
+             <ConfigurationExtensionPurpose>Customization</ConfigurationExtensionPurpose>\
+             <NamePrefix>Св_</NamePrefix></Properties></Configuration></MetaDataObject>",
+        );
+        записать(
+            &ext.join("CommonModules/Св_Сервис/Ext/Module.bsl"),
+            "Процедура Выполнить() Экспорт\n\tОбщегоНазначения.ЗначениеРеквизита(1);\nКонецПроцедуры\n",
+        );
+        записать(
+            &ext.join("CommonModules/ОбщегоНазначения/Ext/Module.bsl"),
+            "&После(\"ЗначениеРеквизита\")\nПроцедура Св_ЗначениеРеквизита(С)\nКонецПроцедуры\n",
+        );
+        записать(
+            &ext.join("Catalogs/Товар.xml"),
+            &справочник("Товар", true, &["Артикул"], &["Св_Поставщик"]),
+        );
+
+        let db = dir.join("index.db");
+        let r = build(&src, &db, None).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let число = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        let строка = |sql: &str| -> String { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+
+        assert_eq!((r.extensions, r.extension_modules), (1, 2));
+        assert_eq!(
+            строка("SELECT name || '|' || rel_root FROM extensions"),
+            "СвоёРасширение|../cfe"
+        );
+        assert_eq!(
+            число(
+                "SELECT count(*) FROM modules WHERE category='CommonModules'
+                   AND rel_path='../cfe/CommonModules/Св_Сервис/Ext/Module.bsl'"
+            ),
+            1,
+            "модуль классифицирован по пути внутри `cfe`, а не как категория `..`"
+        );
+        assert_eq!(
+            строка(
+                "SELECT group_concat(extension_name || ':' || object_name || ':' || belonging, ',')
+                 FROM (SELECT * FROM extension_objects ORDER BY object_name)"
+            ),
+            "СвоёРасширение:Товар:adopted",
+            "состав расширения записан под его именем"
+        );
+        assert_eq!(
+            строка(
+                "SELECT extension_name || ':' || target_method || ':' || annotation
+                 FROM extension_overrides"
+            ),
+            "СвоёРасширение:ЗначениеРеквизита:После"
+        );
+        assert_eq!(
+            число("SELECT count(*) FROM extension_overrides WHERE target_method_line IS NOT NULL"),
+            1,
+            "цель перехвата разрешена в основной конфигурации"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
