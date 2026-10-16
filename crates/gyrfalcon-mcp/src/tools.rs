@@ -169,7 +169,9 @@ pub const TOOLS: &[Tool] = &[
         name: "movements",
         description: "Движения документов по регистрам: кто по каким регистрам пишет. \
              Берётся из ОБЪЯВЛЕННЫХ движений метаданных, а не только из кода — поэтому \
-             видит и то, что пишется подписками и общими модулями.",
+             видит и то, что пишется подписками и общими модулями. Имя — точное \
+             (substring: true — подстрокой); в каждой строке оба имени, документа и \
+             регистра. Пусто — с пометкой found: false и похожими именами.",
         schema: schema_movements,
     },
     Tool {
@@ -394,8 +396,14 @@ fn schema_overrides() -> Value {
 fn schema_movements() -> Value {
     обяз(
         json!({
-            "document": {"type": "string", "description": "Движения этого документа"},
-            "register": {"type": "string", "description": "Кто пишет в этот регистр"}
+            "document": {"type": "string", "description":
+                "Движения этого документа — точное имя (регистр букв не важен)"},
+            "register": {"type": "string", "description":
+                "Кто пишет в этот регистр — точное имя; ЦеныНоменклатуры не включает \
+                 ЦеныНоменклатурыПоставщиков"},
+            "substring": {"type": "boolean", "description":
+                "Искать имя подстрокой, а не точно. Для поиска, а не для ответа \
+                 «кто пишет»: в выдачу попадут и чужие регистры с похожим именем"}
         }),
         &[],
     )
@@ -1412,24 +1420,105 @@ fn есть_таблица(conn: &Connection, имя: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// Движения по точному имени документа или регистра; подстрока — флагом.
+///
+/// # Почему точное имя по умолчанию
+///
+/// До 0.1.19 оба входа шли в `LIKE '%…%'`, а в ответе по регистру не было
+/// имени совпавшего регистра. `register=ЦеныНоменклатуры` на типовой УТ давал
+/// 12 строк, из них 10 — писатели `ЦеныНоменклатурыПоставщиков` и
+/// `ЦеныНоменклатуры25`, и отличить их было не по чему. Модель назвала
+/// регистраторами 9 документов, 7 — лишние. Подстрока нужна для поиска, а не
+/// для ответа «кто пишет в регистр», поэтому она стала явной.
+///
+/// # Почему сравнение в Rust, а не в SQL
+///
+/// `COLLATE NOCASE` и `LIKE` SQLite не различают регистр только у ASCII:
+/// `'ценыноменклатуры' = 'ЦеныНоменклатуры' COLLATE NOCASE` — ложь. Имена 1С
+/// кириллические, так что «без учёта регистра» в SQL здесь было неправдой.
+/// Таблица — тысячи строк, перебор в памяти дешевле, чем выглядит.
 fn movements(conn: &Connection, args: &Value) -> Result<Value, String> {
-    let doc = строка(args, "document");
-    let reg = строка(args, "register");
-    match (doc, reg) {
-        (Some(d), _) => выборка(
-            conn,
-            "SELECT register_name, source, file FROM register_movements
-             WHERE document_name LIKE ?1 COLLATE NOCASE",
-            &[&format!("%{d}%")],
-        ),
-        (None, Some(r)) => выборка(
-            conn,
-            "SELECT document_name, source, file FROM register_movements
-             WHERE register_name LIKE ?1 COLLATE NOCASE",
-            &[&format!("%{r}%")],
-        ),
-        (None, None) => Err("нужен document или register".into()),
+    let (столбец, имя) = match (строка(args, "document"), строка(args, "register")) {
+        (Some(d), _) => (0usize, d),
+        (None, Some(r)) => (1, r),
+        (None, None) => return Err("нужен document или register".into()),
+    };
+    let подстрока = args
+        .get("substring")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // `РегистрСведений.ЦеныНоменклатуры` → `ЦеныНоменклатуры`: в таблице
+    // имена короткие, а квалифицированное имя модель пишет охотно.
+    let ключ = имя.rsplit('.').next().unwrap_or(&имя).trim().to_lowercase();
+    if ключ.is_empty() {
+        return Err("пустое имя".into());
     }
+
+    let mut st = conn
+        .prepare(
+            "SELECT document_name, register_name, source, file FROM register_movements
+             ORDER BY document_name, register_name",
+        )
+        .map_err(|e| e.to_string())?;
+    let все: Vec<[Value; 4]> = st
+        .query_map([], |r| Ok([0, 1, 2, 3].map(|i| значение(r, i))))
+        .map_err(|e| e.to_string())?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|e| e.to_string())?;
+    let имя_строки = |s: &[Value; 4]| s[столбец].as_str().unwrap_or("").to_lowercase();
+
+    let строки: Vec<Value> = все
+        .iter()
+        .filter(|s| {
+            let и = имя_строки(s);
+            if подстрока {
+                и.contains(&ключ)
+            } else {
+                и == ключ
+            }
+        })
+        .map(|s| json!(s))
+        .collect();
+    let mut out = json!({
+        "columns": ["document_name", "register_name", "source", "file"],
+        "match": if подстрока { "substring" } else { "exact" },
+        "count": строки.len(),
+        "rows": строки,
+    });
+
+    if out["count"] == 0 {
+        // Пусто — не ответ, а развилка: имени нет, или оно записано иначе.
+        let mut похожие: Vec<String> = все
+            .iter()
+            .filter(|s| имя_строки(s).contains(&ключ))
+            .filter_map(|s| s[столбец].as_str().map(str::to_string))
+            .collect();
+        похожие.sort();
+        похожие.dedup();
+        let что = if столбец == 0 {
+            "документа"
+        } else {
+            "регистра"
+        };
+        out["found"] = json!(false);
+        out["note"] = if похожие.is_empty() {
+            json!(format!(
+                "{что} «{имя}» нет в объявленных движениях — ни точно, ни подстрокой. \
+                 Это не значит, что объекта нет: у него может не быть движений; \
+                 существование проверяет find/object"
+            ))
+        } else {
+            json!(format!(
+                "точного имени {что} «{имя}» нет; подстрокой есть: {} — \
+                 повторите с точным именем",
+                похожие.join(", ")
+            ))
+        };
+        if !похожие.is_empty() {
+            out["similar"] = json!(похожие);
+        }
+    }
+    Ok(out)
 }
 
 fn схема(conn: &Connection, args: &Value) -> Result<Value, String> {
@@ -1507,6 +1596,119 @@ fn coverage(conn: &Connection) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Регистры с общим началом имени — как в типовой УТ.
+    fn индекс_движений() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(gyrfalcon_index::ddl::SCHEMA_INTEGRATION)
+            .unwrap();
+        c.execute_batch(
+            "INSERT INTO register_movements (document_name, register_name, source, file) VALUES
+               ('УстановкаЦенНоменклатуры','ЦеныНоменклатуры','declared','Documents/УстановкаЦенНоменклатуры.xml'),
+               ('УстановкаЦенНоменклатуры','ЦеныНоменклатуры25','declared','Documents/УстановкаЦенНоменклатуры.xml'),
+               ('ЗаказПоставщику','ЦеныНоменклатурыПоставщиков','declared','Documents/ЗаказПоставщику.xml'),
+               ('ЗаказПоставщикуИзменение','ТоварыКПоступлению','declared','Documents/ЗаказПоставщикуИзменение.xml');",
+        )
+        .unwrap();
+        c
+    }
+
+    fn движения(c: &Connection, a: Value) -> Value {
+        call(c, Profile::All, "movements", &a).unwrap()
+    }
+
+    fn пары(v: &Value) -> Vec<(String, String)> {
+        v["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r[0].as_str().unwrap().into(), r[1].as_str().unwrap().into()))
+            .collect()
+    }
+
+    /// `ЦеныНоменклатуры` не возвращает писателей `ЦеныНоменклатурыПоставщиков`
+    /// и `ЦеныНоменклатуры25` — замер на УТ: 12 строк, из них лишних 10.
+    #[test]
+    fn регистр_по_точному_имени() {
+        let c = индекс_движений();
+        let v = движения(&c, json!({"register": "ЦеныНоменклатуры"}));
+        assert_eq!(
+            пары(&v),
+            [("УстановкаЦенНоменклатуры".into(), "ЦеныНоменклатуры".into())],
+            "{v}"
+        );
+        assert_eq!(v["match"], "exact");
+        assert_eq!(
+            v["columns"][1], "register_name",
+            "имя совпавшего регистра в ответе"
+        );
+    }
+
+    /// Точно — и по документу: `ЗаказПоставщику` не тянет `ЗаказПоставщикуИзменение`.
+    #[test]
+    fn документ_по_точному_имени() {
+        let c = индекс_движений();
+        let v = движения(&c, json!({"document": "ЗаказПоставщику"}));
+        assert_eq!(
+            пары(&v),
+            [(
+                "ЗаказПоставщику".into(),
+                "ЦеныНоменклатурыПоставщиков".into()
+            )],
+            "{v}"
+        );
+    }
+
+    /// Регистр кириллицы не важен — чего `COLLATE NOCASE` SQLite не умеет —
+    /// и квалифицированное имя приводится к короткому.
+    #[test]
+    fn регистр_букв_и_квалификатор_не_мешают() {
+        let c = индекс_движений();
+        for имя in ["ценыноменклатуры", "РегистрСведений.ЦеныНоменклатуры"]
+        {
+            let v = движения(&c, json!({"register": имя}));
+            assert_eq!(v["count"], 1, "{имя}: {v}");
+        }
+    }
+
+    /// Подстрока — только флагом, и тогда в каждой строке видно, что совпало.
+    #[test]
+    fn подстрока_явным_флагом() {
+        let c = индекс_движений();
+        let v = движения(
+            &c,
+            json!({"register": "ЦеныНоменклатуры", "substring": true}),
+        );
+        assert_eq!(v["match"], "substring");
+        let mut регистры: Vec<String> = пары(&v).into_iter().map(|(_, r)| r).collect();
+        регистры.sort();
+        assert_eq!(
+            регистры,
+            [
+                "ЦеныНоменклатуры",
+                "ЦеныНоменклатуры25",
+                "ЦеныНоменклатурыПоставщиков"
+            ]
+        );
+    }
+
+    /// Пусто — с пометкой и похожими именами, а не голый пустой список.
+    #[test]
+    fn пусто_с_пометкой_и_похожими() {
+        let c = индекс_движений();
+        let v = движения(&c, json!({"register": "ЦеныНоменклатурыПоставщ"}));
+        assert_eq!(
+            (v["count"].clone(), v["found"].clone()),
+            (json!(0), json!(false)),
+            "{v}"
+        );
+        assert_eq!(v["similar"], json!(["ЦеныНоменклатурыПоставщиков"]));
+
+        let v = движения(&c, json!({"document": "ПоступлениеТоваровУслуг"}));
+        assert_eq!(v["found"], false);
+        assert!(v.get("similar").is_none(), "{v}");
+        assert!(v["note"].as_str().unwrap().contains("find/object"), "{v}");
+    }
 
     /// Расширение без перехватов обязано быть в списке (Р-022).
     ///
