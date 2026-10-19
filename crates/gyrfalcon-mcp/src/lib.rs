@@ -11,6 +11,7 @@ pub mod changes;
 pub mod check_bsl;
 pub mod check_scope;
 pub mod freshness_guard;
+pub mod gitsync;
 pub mod grep;
 pub mod hooks;
 pub mod http;

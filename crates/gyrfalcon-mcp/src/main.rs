@@ -6,7 +6,9 @@
 //! девятью инструментами и профилями под роль (Р-101, Р-104). Плюс прежние
 //! команды сборки и замера.
 
-use gyrfalcon_mcp::{hooks, http, install, mcp_http, project_practices, registry, server, tools};
+use gyrfalcon_mcp::{
+    gitsync, hooks, http, install, mcp_http, project_practices, registry, server, tools,
+};
 
 use gyrfalcon_index::schema;
 use gyrfalcon_parser::scan;
@@ -92,6 +94,10 @@ fn print_help() {
 Команды:
   serve --db <файл.db> | --index-dir <каталог> [--profile all|analysis|scout]
                       [--auto-update]  догонять индекс по .bsl самому (по умолчанию нет)
+                      [--git-sync 15m] тянуть git-репозитории проектов и обновлять индекс
+                                       (pull --ff-only по чистой рабочей копии; .bsl — инкрементом,
+                                       метаданные — полной пересборкой; или GYRFALCON_GIT_SYNC=15m)
+                      [--dict <словарь.db>] словарь векторов для автопересборки (или GYRFALCON_DICT)
                       [--semantic-cache-mb 1536]
                                        держать векторы смыслового поиска в памяти
                                        (потолок на все индексы; 0 — читать с диска каждый раз)
@@ -602,6 +608,14 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     // него: он живёт долго, и перечитывать 580 тысяч векторов на каждый
     // `find` (1,4 из 1,8 с, замер 01.10.2026) дороже, чем держать их.
     let mut semantic_cache_mb: usize = 1536;
+    // Автосинхронизация git: периодический pull --ff-only и обновление
+    // индекса. Выключена по умолчанию — pull меняет чужую рабочую копию,
+    // и решать это за человека нельзя.
+    let mut флаг_гит_синка: Option<String> = None;
+    // Словарь векторов для автоматических полных пересборок: без него
+    // пересборка индекса, собранного со словарём, деградирует семантику
+    // до random indexing — молча.
+    let mut флаг_словаря: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -622,6 +636,16 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
                     .ok_or_else(|| format!("неизвестный профиль '{v}': all | analysis | scout"))?;
             }
             "--auto-update" => auto_update = true,
+            "--git-sync" => {
+                i += 1;
+                флаг_гит_синка =
+                    Some(args.get(i).ok_or("--git-sync без значения (например: 15m)")?.clone());
+            }
+            "--dict" => {
+                i += 1;
+                флаг_словаря =
+                    Some(PathBuf::from(args.get(i).ok_or("--dict без значения")?));
+            }
             "--http" => http = true,
             "--port" => {
                 i += 1;
@@ -680,7 +704,41 @@ fn cmd_serve(args: &[String]) -> Result<(), String> {
     }
     let источник = registry::Источник::из_аргументов(db, index_dir)?;
     gyrfalcon_index::semantic::set_cache_limit(semantic_cache_mb);
-    let сервер = server::Server::new(источник, profile).с_автодосборкой(auto_update);
+
+    // Интервал синхронизации: флаг имеет приоритет, env — запасной путь
+    // (в Docker/compose менять флаги перезапуском контейнера неудобно).
+    // «off»/«0» в env — явное выключение, а не ошибка формата.
+    let гит_синк = match флаг_гит_синка {
+        Some(текст) => Some(gitsync::разобрать_интервал(&текст)?),
+        None => match std::env::var("GYRFALCON_GIT_SYNC") {
+            Ok(v) => match v.trim() {
+                "" | "off" | "0" => None,
+                иное => Some(gitsync::разобрать_интервал(иное)?),
+            },
+            Err(_) => None,
+        },
+    };
+    // Словарь для автопересборки — тем же правилом: флаг > env.
+    let словарь = флаг_словаря.or_else(|| {
+        std::env::var("GYRFALCON_DICT")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(PathBuf::from)
+    });
+
+    let сервер = server::Server::new(источник, profile)
+        .с_автодосборкой(auto_update)
+        .с_гит_синхронизацией(гит_синк)
+        .со_словарём(словарь);
+    // Нить синхронизации стартует ДО транспорта: проекты открываются лениво,
+    // и поток должен увидеть каждый, который откроется позже.
+    if let Some(интервал) = гит_синк {
+        let _ручка = сервер.запустить_гит_синк();
+        eprintln!(
+            "git-синхронизация: каждые {}",
+            gitsync::описать_интервал(интервал)
+        );
+    }
     if http {
         mcp_http::serve(
             сервер,
